@@ -1,8 +1,11 @@
 """FastAPI application entry point."""
 
+import sys
 import os
-os.environ["HF_HUB_OFFLINE"] = "1"
-os.environ["TRANSFORMERS_OFFLINE"] = "1"
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+from src.config import ensure_hf_offline_if_needed
+ensure_hf_offline_if_needed()
 
 import logging
 

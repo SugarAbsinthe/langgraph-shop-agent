@@ -5,12 +5,7 @@ The first request triggers initialization; subsequent requests reuse.
 """
 
 import logging
-import os
 from pathlib import Path
-
-# Model is cached locally — force offline to avoid HuggingFace timeout
-os.environ["HF_HUB_OFFLINE"] = "1"
-os.environ["TRANSFORMERS_OFFLINE"] = "1"
 
 logger = logging.getLogger(__name__)
 
