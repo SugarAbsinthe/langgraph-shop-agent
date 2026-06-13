@@ -203,8 +203,8 @@ export function useChat() {
             type: "SET_RESPONSE",
             payload: {
               stage: meta.stage,
-              user_profile: state.lastProfile,
-              product_context: state.lastProductContext,
+              user_profile: meta.user_profile || state.lastProfile,
+              product_context: meta.product_context || state.lastProductContext,
               tool_rounds: meta.tool_rounds,
             },
           });

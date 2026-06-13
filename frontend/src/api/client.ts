@@ -44,7 +44,7 @@ export interface StreamCallbacks {
   onToken: (content: string) => void;
   onStatus: (message: string) => void;
   onStage: (stage: string) => void;
-  onDone: (meta: { stage: string; tool_rounds: number }) => void;
+  onDone: (meta: { stage: string; tool_rounds: number; product_context?: string; user_profile?: string }) => void;
   onError: (message: string) => void;
 }
 

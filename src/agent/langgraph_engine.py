@@ -249,14 +249,12 @@ class ShoppingGuideGraph:
                          chat_history: list = None):
         """Async generator: yields SSE-formatted strings for streaming.
 
-        Events emitted:
-          event: stage  — conversation stage after analysis
-          event: status — tool-call status or phase transition
-          event: token  — LLM output token
-          event: done   — final metadata (stage, tool_rounds, ...)
-          event: error  — exception details
+        Runs the sync graph, then streams the answer token by token
+        with status events to simulate real-time feedback.
         """
+        import asyncio
         import json as _json
+
         initial_state = {
             "messages": (chat_history or []) + [HumanMessage(content=user_message)],
             "conv_id": conv_id,
@@ -270,46 +268,46 @@ class ShoppingGuideGraph:
             "error": "",
         }
 
-        final_stage = "discovery"
-        final_tool_rounds = 0
-        token_count = 0
+        def _emit(event_type, data):
+            return f"event: {event_type}\ndata: {_json.dumps(data, ensure_ascii=False)}\n\n"
 
         try:
-            async for event in self._get_stream_graph().astream_events(initial_state, version="v2"):
-                kind = event.get("event", "")
-                name = event.get("name", "")
-                data = event.get("data", {})
+            # Run sync graph in thread pool (non-blocking)
+            yield _emit("status", {"message": "正在分析需求..."})
+            result = await asyncio.get_event_loop().run_in_executor(
+                None, lambda: self.graph.invoke(initial_state)
+            )
 
-                # --- LLM token streaming (only from agent node) ---
-                if kind == "on_chat_model_stream" and name == "agent":
-                    chunk = data.get("chunk")
-                    if chunk and hasattr(chunk, "content") and chunk.content:
-                        token_count += 1
-                        token_text = chunk.content
-                        if isinstance(token_text, list):
-                            token_text = "".join(token_text)
-                        yield f"event: token\ndata: {_json.dumps({'content': str(token_text)}, ensure_ascii=False)}\n\n"
+            # Extract answer and metadata
+            answer = ""
+            for m in reversed(result.get("messages", [])):
+                if isinstance(m, AIMessage) and m.content:
+                    answer = m.content
+                    break
 
-                # --- Tool call start ---
-                elif kind == "on_tool_start":
-                    tool_name = name or event.get("metadata", {}).get("tool_name", "tool")
-                    yield f"event: status\ndata: {_json.dumps({'message': f'正在调用 {tool_name}...'}, ensure_ascii=False)}\n\n"
+            stage = result.get("stage", "discovery")
+            tool_rounds = result.get("tool_rounds", 0)
+            yield _emit("stage", {"stage": stage})
 
-                # --- Node completion (capture state changes) ---
-                elif kind == "on_chain_end" and isinstance(data, dict):
-                    output = data.get("output", {})
-                    if isinstance(output, dict):
-                        if "stage" in output:
-                            final_stage = output["stage"]
-                            yield f"event: stage\ndata: {_json.dumps({'stage': final_stage}, ensure_ascii=False)}\n\n"
-                        if "tool_rounds" in output:
-                            final_tool_rounds = output["tool_rounds"]
+            # Stream answer token by token for visual effect
+            if answer:
+                # Send in sentence-sized chunks for natural pacing
+                import re
+                chunks = re.split(r'(?<=[。！？\n])', answer)
+                for chunk in chunks:
+                    if chunk:
+                        yield _emit("token", {"content": chunk})
+                        await asyncio.sleep(0.02)  # small delay for visual pacing
 
-            # --- Final done event ---
-            yield f"event: done\ndata: {_json.dumps({'stage': final_stage, 'tool_rounds': final_tool_rounds, 'tokens': token_count}, ensure_ascii=False)}\n\n"
+            yield _emit("done", {
+                "stage": stage,
+                "tool_rounds": tool_rounds,
+                "product_context": result.get("product_context", ""),
+                "user_profile": result.get("user_profile", ""),
+            })
 
         except Exception as exc:
-            yield f"event: error\ndata: {_json.dumps({'message': str(exc)}, ensure_ascii=False)}\n\n"
+            yield _emit("error", {"message": str(exc)})
 
     def run(self, user_message: str, conv_id: str,
             chat_history: list = None) -> dict:
