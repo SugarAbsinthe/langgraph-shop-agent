@@ -56,14 +56,33 @@ class ShoppingGuideGraph:
         self.max_tool_rounds = max_tool_rounds
         self.stage_prompts = stage_prompts or {}
 
-        self.graph = self._build_graph()
+        self.graph = self._build_graph(use_async=False)
+        self._stream_graph = None  # lazily built for streaming
 
-    def _build_graph(self):
+        # Build streaming LLM for async nodes
+        try:
+            from langchain_openai import ChatOpenAI
+            if isinstance(llm, ChatOpenAI):
+                sllm = ChatOpenAI(
+                    model=llm.model_name,
+                    openai_api_key=llm.openai_api_key,
+                    openai_api_base=llm.openai_api_base,
+                    streaming=True,
+                    temperature=llm.temperature,
+                    request_timeout=llm.request_timeout,
+                )
+                self.llm_stream = sllm.bind_tools(tools)
+            else:
+                self.llm_stream = self.llm_with_tools
+        except Exception:
+            self.llm_stream = self.llm_with_tools
+
+    def _build_graph(self, use_async: bool = False):
         workflow = StateGraph(ShoppingState)
 
         workflow.add_node("analyze", self._analyze_node)
         workflow.add_node("retrieve", self._retrieve_node)
-        workflow.add_node("agent", self._agent_node)
+        workflow.add_node("agent", self._agent_node_async if use_async else self._agent_node)
         workflow.add_node("tools", ToolNode(self.tools))
 
         workflow.set_entry_point("analyze")
@@ -77,6 +96,11 @@ class ShoppingGuideGraph:
         workflow.add_edge("tools", "agent")
 
         return workflow.compile()
+
+    def _get_stream_graph(self):
+        if self._stream_graph is None:
+            self._stream_graph = self._build_graph(use_async=True)
+        return self._stream_graph
 
     # ---- Nodes ----
 
@@ -166,6 +190,36 @@ class ShoppingGuideGraph:
             "tool_rounds": tool_rounds + 1,
         }
 
+    async def _agent_node_async(self, state: ShoppingState) -> dict:
+        """Async agent node using streaming LLM for token-level events."""
+        stage = state.get("stage", "discovery")
+        user_profile = state.get("user_profile", "(暂无画像)")
+        product_context = state.get("product_context", "")
+        conv_id = state.get("conv_id", "")
+        tool_rounds = state.get("tool_rounds", 0)
+
+        prompt = self.stage_prompts.get(stage, self.system_prompt)
+        system_text = prompt.format(
+            conv_id=conv_id, stage=stage,
+            user_profile=user_profile,
+            product_context=product_context or "(尚未搜索产品，请先挖掘用户需求)",
+        )
+
+        full_messages = [SystemMessage(content=system_text)] + list(state["messages"])
+
+        # Use astream so astream_events can capture on_chat_model_stream
+        response = None
+        async for chunk in self.llm_stream.astream(full_messages):
+            if response is None:
+                response = chunk
+            else:
+                response += chunk
+
+        return {
+            "messages": [response] if response else [],
+            "tool_rounds": tool_rounds + 1,
+        }
+
     # ---- Routing ----
 
     def _route_after_agent(self, state: ShoppingState) -> Literal["tools", "end"]:
@@ -221,7 +275,7 @@ class ShoppingGuideGraph:
         token_count = 0
 
         try:
-            async for event in self.graph.astream_events(initial_state, version="v2"):
+            async for event in self._get_stream_graph().astream_events(initial_state, version="v2"):
                 kind = event.get("event", "")
                 name = event.get("name", "")
                 data = event.get("data", {})
