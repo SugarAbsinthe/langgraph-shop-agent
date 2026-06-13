@@ -191,6 +191,72 @@ class ShoppingGuideGraph:
 
     # ---- Public API ----
 
+    async def run_stream(self, user_message: str, conv_id: str,
+                         chat_history: list = None):
+        """Async generator: yields SSE-formatted strings for streaming.
+
+        Events emitted:
+          event: stage  — conversation stage after analysis
+          event: status — tool-call status or phase transition
+          event: token  — LLM output token
+          event: done   — final metadata (stage, tool_rounds, ...)
+          event: error  — exception details
+        """
+        import json as _json
+        initial_state = {
+            "messages": (chat_history or []) + [HumanMessage(content=user_message)],
+            "conv_id": conv_id,
+            "stage": "discovery",
+            "product_context": "",
+            "user_profile": "",
+            "tool_rounds": 0,
+            "supervisor_rounds": 0,
+            "supervisor_decision": "continue",
+            "next_worker": "discovery",
+            "error": "",
+        }
+
+        final_stage = "discovery"
+        final_tool_rounds = 0
+        token_count = 0
+
+        try:
+            async for event in self.graph.astream_events(initial_state, version="v2"):
+                kind = event.get("event", "")
+                name = event.get("name", "")
+                data = event.get("data", {})
+
+                # --- LLM token streaming (only from agent node) ---
+                if kind == "on_chat_model_stream" and name == "agent":
+                    chunk = data.get("chunk")
+                    if chunk and hasattr(chunk, "content") and chunk.content:
+                        token_count += 1
+                        token_text = chunk.content
+                        if isinstance(token_text, list):
+                            token_text = "".join(token_text)
+                        yield f"event: token\ndata: {_json.dumps({'content': str(token_text)}, ensure_ascii=False)}\n\n"
+
+                # --- Tool call start ---
+                elif kind == "on_tool_start":
+                    tool_name = name or event.get("metadata", {}).get("tool_name", "tool")
+                    yield f"event: status\ndata: {_json.dumps({'message': f'正在调用 {tool_name}...'}, ensure_ascii=False)}\n\n"
+
+                # --- Node completion (capture state changes) ---
+                elif kind == "on_chain_end" and isinstance(data, dict):
+                    output = data.get("output", {})
+                    if isinstance(output, dict):
+                        if "stage" in output:
+                            final_stage = output["stage"]
+                            yield f"event: stage\ndata: {_json.dumps({'stage': final_stage}, ensure_ascii=False)}\n\n"
+                        if "tool_rounds" in output:
+                            final_tool_rounds = output["tool_rounds"]
+
+            # --- Final done event ---
+            yield f"event: done\ndata: {_json.dumps({'stage': final_stage, 'tool_rounds': final_tool_rounds, 'tokens': token_count}, ensure_ascii=False)}\n\n"
+
+        except Exception as exc:
+            yield f"event: error\ndata: {_json.dumps({'message': str(exc)}, ensure_ascii=False)}\n\n"
+
     def run(self, user_message: str, conv_id: str,
             chat_history: list = None) -> dict:
         """Run the graph for one conversation turn.

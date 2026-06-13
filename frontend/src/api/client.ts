@@ -40,6 +40,77 @@ export async function sendMessage(
   });
 }
 
+export interface StreamCallbacks {
+  onToken: (content: string) => void;
+  onStatus: (message: string) => void;
+  onStage: (stage: string) => void;
+  onDone: (meta: { stage: string; tool_rounds: number }) => void;
+  onError: (message: string) => void;
+}
+
+export async function sendMessageStream(
+  convId: string,
+  question: string,
+  chatHistory: { role: string; content: string }[],
+  callbacks: StreamCallbacks,
+): Promise<void> {
+  const res = await fetch("/api/chat/stream", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      conv_id: convId,
+      question,
+      chat_history: chatHistory,
+    }),
+  });
+
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({ detail: res.statusText }));
+    throw new Error(err.detail || `HTTP ${res.status}`);
+  }
+
+  const reader = res.body?.getReader();
+  if (!reader) throw new Error("No response body");
+
+  const decoder = new TextDecoder();
+  let buffer = "";
+
+  while (true) {
+    const { done, value } = await reader.read();
+    if (done) break;
+
+    buffer += decoder.decode(value, { stream: true });
+    const lines = buffer.split("\n");
+    buffer = lines.pop() || "";
+
+    let eventType = "";
+    for (const line of lines) {
+      if (line.startsWith("event: ")) {
+        eventType = line.slice(7).trim();
+      } else if (line.startsWith("data: ")) {
+        const data = JSON.parse(line.slice(6));
+        switch (eventType) {
+          case "token":
+            callbacks.onToken(data.content);
+            break;
+          case "status":
+            callbacks.onStatus(data.message);
+            break;
+          case "stage":
+            callbacks.onStage(data.stage);
+            break;
+          case "done":
+            callbacks.onDone(data);
+            break;
+          case "error":
+            callbacks.onError(data.message);
+            break;
+        }
+      }
+    }
+  }
+}
+
 /* ---- Conversations ---- */
 
 export async function listConversations() {

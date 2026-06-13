@@ -122,6 +122,14 @@ class ShoppingGuideAgent:
             "tool_rounds": result["tool_rounds"],
         }
 
+    async def run_stream(self, question: str, conv_id: str = "default",
+                         chat_history: list = None):
+        """Async generator yielding SSE-formatted events for streaming chat."""
+        async for event in self.graph.run_stream(
+            user_message=question, conv_id=conv_id, chat_history=chat_history,
+        ):
+            yield event
+
     def run_simple(self, question: str, conv_id: str = "default") -> dict:
         """Simplified single-shot mode: no LangGraph, one LLM call with tools.
 
