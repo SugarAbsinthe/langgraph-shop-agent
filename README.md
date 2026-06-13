@@ -5,13 +5,12 @@
 ## 快速开始
 
 ```bash
-# 安装依赖
+# Docker（推荐，一键启动后端 + 前端 + Redis）
+docker compose up
+
+# 或手动启动
 pip install -e .
-
-# 启动后端
 python -m uvicorn backend.main:app --port 8000
-
-# 启动前端（新终端）
 cd frontend && npm install && npm run dev
 ```
 
@@ -29,6 +28,7 @@ src/cache/     Redis 缓存
 src/db/        对话持久化
 backend/       FastAPI
 frontend/      React
+tests/         测试
 ```
 
 ## License
