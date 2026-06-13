@@ -1,0 +1,43 @@
+@import "tailwindcss";
+
+:root {
+  --brand: #4f46e5;
+  --brand-light: #eef2ff;
+  --assistant-bg: #f8fafc;
+  --border: #e2e8f0;
+}
+
+body {
+  margin: 0;
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif;
+  background: #fff;
+  -webkit-font-smoothing: antialiased;
+}
+
+/* ---- Markdown ---- */
+.markdown-body h1 { font-size: 1.25rem; font-weight: 700; margin: 0.6rem 0 0.3rem; }
+.markdown-body h2 { font-size: 1.1rem; font-weight: 700; margin: 0.5rem 0 0.25rem; color: #1e293b; }
+.markdown-body h3 { font-size: 1rem; font-weight: 600; margin: 0.4rem 0 0.2rem; }
+.markdown-body p { margin: 0.25rem 0; line-height: 1.7; }
+.markdown-body ul, .markdown-body ol { padding-left: 1.25rem; margin: 0.25rem 0; }
+.markdown-body li { margin: 0.12rem 0; line-height: 1.6; }
+.markdown-body table { border-collapse: collapse; width: 100%; margin: 0.5rem 0; font-size: 0.82rem; border-radius: 8px; overflow: hidden; }
+.markdown-body th, .markdown-body td { border: 1px solid #e2e8f0; padding: 0.4rem 0.6rem; text-align: left; }
+.markdown-body th { background: #f1f5f9; font-weight: 600; color: #475569; }
+.markdown-body td { background: #fff; }
+.markdown-body code { background: #f1f5f9; padding: 0.1rem 0.35rem; border-radius: 4px; font-size: 0.85em; color: #e11d48; }
+.markdown-body strong { font-weight: 700; color: #1e293b; }
+.markdown-body em { color: #64748b; }
+
+/* ---- Scrollbar ---- */
+::-webkit-scrollbar { width: 5px; }
+::-webkit-scrollbar-track { background: transparent; }
+::-webkit-scrollbar-thumb { background: #cbd5e1; border-radius: 10px; }
+::-webkit-scrollbar-thumb:hover { background: #94a3b8; }
+
+/* ---- Shared animations ---- */
+@keyframes fadeIn {
+  from { opacity: 0; transform: translateY(4px); }
+  to   { opacity: 1; transform: translateY(0); }
+}
+.animate-in { animation: fadeIn 0.25s ease-out; }

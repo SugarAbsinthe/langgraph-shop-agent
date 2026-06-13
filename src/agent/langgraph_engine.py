@@ -1,0 +1,359 @@
+"""LangGraph state machine for the shopping guide Agent.
+
+Four-node graph:
+  analyze  — load profile, classify stage, extract new profile signals
+  retrieve — profile-augmented product search
+  agent    — LLM with tools (loops max 3 rounds via tools node)
+  tools    — ToolNode executes tool calls
+
+Flow: analyze → retrieve → agent ⇄ tools → END
+"""
+
+from typing import Annotated, TypedDict, Literal
+
+from langgraph.graph import StateGraph, END
+from langgraph.graph.message import add_messages
+from langgraph.prebuilt import ToolNode
+from langchain.schema import SystemMessage, HumanMessage, AIMessage
+
+
+class ShoppingState(TypedDict):
+    messages: Annotated[list, add_messages]
+    conv_id: str
+    stage: str
+    product_context: str
+    user_profile: str
+    tool_rounds: int
+    supervisor_rounds: int        # outer loop counter for multi-agent supervisor
+    supervisor_decision: str      # "continue" | "finish"
+    next_worker: str              # routing target: "discovery"|"search"|"compare"|"profile"|"recommend"|"end"
+    error: str                    # error passthrough between agents
+
+
+class ShoppingGuideGraph:
+    """LangGraph state machine for shopping guide conversations.
+
+    Four-node graph:
+      analyze  — load profile, classify stage, extract new profile signals
+      retrieve — profile-augmented product search
+      agent    — LLM with tools (loops max 3 rounds via tools node)
+                  dynamically selects per-stage prompt to stay focused
+      tools    — ToolNode executes tool calls
+
+    Flow: analyze → retrieve → agent ⇄ tools → END
+    """
+
+    def __init__(self, llm, tools: list, product_retriever, profile_store,
+                 system_prompt: str, stage_classifier_prompt: str,
+                 max_tool_rounds: int = 3, stage_prompts: dict = None):
+        self.llm = llm
+        self.llm_with_tools = llm.bind_tools(tools)
+        self.tools = tools
+        self.product_retriever = product_retriever
+        self.profile_store = profile_store
+        self.system_prompt = system_prompt
+        self.stage_classifier_prompt = stage_classifier_prompt
+        self.max_tool_rounds = max_tool_rounds
+        self.stage_prompts = stage_prompts or {}
+
+        self.graph = self._build_graph()
+
+    def _build_graph(self):
+        workflow = StateGraph(ShoppingState)
+
+        workflow.add_node("analyze", self._analyze_node)
+        workflow.add_node("retrieve", self._retrieve_node)
+        workflow.add_node("agent", self._agent_node)
+        workflow.add_node("tools", ToolNode(self.tools))
+
+        workflow.set_entry_point("analyze")
+        workflow.add_edge("analyze", "retrieve")
+        workflow.add_edge("retrieve", "agent")
+        workflow.add_conditional_edges(
+            "agent",
+            self._route_after_agent,
+            {"tools": "tools", "end": END}
+        )
+        workflow.add_edge("tools", "agent")
+
+        return workflow.compile()
+
+    # ---- Nodes ----
+
+    def _analyze_node(self, state: ShoppingState) -> dict:
+        conv_id = state["conv_id"]
+        messages = state["messages"]
+
+        # Load current profile
+        user_profile = self.profile_store.serialize_profile(conv_id)
+
+        # Get last user message for stage classification
+        last_user_msg = ""
+        for m in reversed(messages):
+            if isinstance(m, HumanMessage):
+                last_user_msg = m.content
+                break
+
+        # Classify stage
+        stage = self._classify_stage(last_user_msg, state.get("stage", "discovery"))
+
+        # Extract profile signals from user message (lightweight extraction)
+        if last_user_msg:
+            self._extract_profile_signals(conv_id, last_user_msg)
+
+        # Reload profile after extraction
+        user_profile = self.profile_store.serialize_profile(conv_id)
+
+        return {
+            "stage": stage,
+            "user_profile": user_profile,
+        }
+
+    def _retrieve_node(self, state: ShoppingState) -> dict:
+        stage = state.get("stage", "discovery")
+        user_profile = state.get("user_profile", "")
+        messages = state["messages"]
+
+        # Only search products in relevant stages
+        if stage not in ("search", "comparison", "recommendation", "objection_handling"):
+            return {"product_context": ""}
+
+        # Build profile-augmented query from last user message
+        last_user_msg = ""
+        for m in reversed(messages):
+            if isinstance(m, HumanMessage):
+                last_user_msg = m.content
+                break
+
+        if not last_user_msg:
+            return {"product_context": ""}
+
+        # Augment query with profile context
+        augmented_query = last_user_msg
+        if user_profile and user_profile != "(暂无画像)":
+            augmented_query = f"{last_user_msg}\n用户画像: {user_profile}"
+
+        try:
+            product_context = self.product_retriever.retrieve(augmented_query, top_k=5)
+        except Exception:
+            product_context = "(产品检索暂时不可用)"
+
+        return {"product_context": product_context}
+
+    def _agent_node(self, state: ShoppingState) -> dict:
+        stage = state.get("stage", "discovery")
+        user_profile = state.get("user_profile", "(暂无画像)")
+        product_context = state.get("product_context", "")
+        conv_id = state.get("conv_id", "")
+        tool_rounds = state.get("tool_rounds", 0)
+
+        # Select per-stage prompt, fall back to default system prompt
+        prompt = self.stage_prompts.get(stage, self.system_prompt)
+        system_text = prompt.format(
+            conv_id=conv_id,
+            stage=stage,
+            user_profile=user_profile,
+            product_context=product_context or "(尚未搜索产品，请先挖掘用户需求)",
+        )
+
+        # Prepare messages for LLM: system + conversation
+        full_messages = [SystemMessage(content=system_text)] + list(state["messages"])
+
+        response = self.llm_with_tools.invoke(full_messages)
+
+        return {
+            "messages": [response],
+            "tool_rounds": tool_rounds + 1,
+        }
+
+    # ---- Routing ----
+
+    def _route_after_agent(self, state: ShoppingState) -> Literal["tools", "end"]:
+        messages = state["messages"]
+        tool_rounds = state.get("tool_rounds", 0)
+
+        last_msg = messages[-1] if messages else None
+        if last_msg and isinstance(last_msg, AIMessage) and last_msg.tool_calls:
+            if tool_rounds >= self.max_tool_rounds:
+                return "end"
+            return "tools"
+        return "end"
+
+    # ---- Helpers ----
+
+    def _classify_stage(self, user_message: str, current_stage: str) -> str:
+        """Classify the conversation stage via lightweight LLM call."""
+        return classify_stage(user_message, current_stage, self.llm, self.stage_classifier_prompt)
+
+    def _extract_profile_signals(self, conv_id: str, user_message: str) -> None:
+        """Lightweight profile signal extraction from user message."""
+        extract_profile_signals(conv_id, user_message, self.profile_store)
+
+    # ---- Public API ----
+
+    def run(self, user_message: str, conv_id: str,
+            chat_history: list = None) -> dict:
+        """Run the graph for one conversation turn.
+
+        Args:
+            user_message: The user's latest message.
+            conv_id: Conversation ID for profile persistence.
+            chat_history: Optional list of prior LangChain messages.
+
+        Returns:
+            dict with keys: messages, stage, product_context, user_profile, tool_rounds
+        """
+        initial_state = {
+            "messages": (chat_history or []) + [HumanMessage(content=user_message)],
+            "conv_id": conv_id,
+            "stage": "discovery",
+            "product_context": "",
+            "user_profile": "",
+            "tool_rounds": 0,
+        }
+
+        result = self.graph.invoke(initial_state)
+
+        return {
+            "messages": result["messages"],
+            "stage": result.get("stage", "discovery"),
+            "product_context": result.get("product_context", ""),
+            "user_profile": result.get("user_profile", ""),
+            "tool_rounds": result.get("tool_rounds", 0),
+        }
+
+
+# ---- Standalone helpers (usable by both old and new architecture) ----
+
+
+def classify_stage(user_message: str, current_stage: str, llm=None,
+                   stage_classifier_prompt: str = "") -> str:
+    """Classify the conversation stage.
+
+    Uses regex keyword heuristics first (~70% coverage), falls back to
+    LLM classification for ambiguous cases. Callable from both
+    ShoppingGuideGraph and SupervisorGraph.
+    """
+    if not user_message:
+        return current_stage or "discovery"
+
+    msg_lower = user_message.lower()
+
+    # Short greeting → discovery
+    if len(user_message) < 10 and any(kw in msg_lower for kw in ["你好", "hi", "hello", "在吗"]):
+        return "discovery"
+
+    # Comparison keywords → comparison
+    if any(kw in msg_lower for kw in ["对比", "比较", "区别", "哪个好", "选哪个", "vs"]):
+        return "comparison"
+
+    # Objection/concern keywords → objection_handling
+    if any(kw in msg_lower for kw in ["质量", "售后", "靠谱吗", "行不行", "问题多", "会不会",
+                                        "散热", "卡不卡", "耐用", "翻车", "差评"]):
+        return "objection_handling"
+
+    # Needs keywords → needs_elicitation
+    if any(kw in msg_lower for kw in ["预算", "打游戏", "办公", "出差", "学生", "轻薄",
+                                        "画图", "剪视频", "编程", "做图", "渲染"]):
+        return "needs_elicitation"
+
+    # Search intent → search
+    if any(kw in msg_lower for kw in ["推荐", "找", "搜索", "有没有", "买什么", "选一个",
+                                        "有什么", "哪些"]):
+        return "search"
+
+    # Summary/closing
+    if any(kw in msg_lower for kw in ["谢谢", "好的", "了解了", "就这个", "下单", "买了"]):
+        return "summary"
+
+    # Fallback: use LLM for ambiguous cases
+    if llm is not None and stage_classifier_prompt:
+        try:
+            prompt = stage_classifier_prompt.format(
+                current_stage=current_stage,
+                user_message=user_message,
+            )
+            result = llm.invoke(prompt)
+            stage = result.content.strip().lower()
+            valid_stages = {"discovery", "needs_elicitation", "search", "comparison",
+                            "objection_handling", "recommendation", "summary"}
+            if stage in valid_stages:
+                return stage
+        except Exception:
+            pass
+
+    return current_stage or "discovery"
+
+
+def extract_profile_signals(conv_id: str, user_message: str, profile_store) -> None:
+    """Lightweight profile signal extraction from user message.
+
+    Extracts: budget, product_category, primary_use, mobility,
+    preferred_brand, exclude_brand. Callable from both
+    ShoppingGuideGraph and SupervisorGraph.
+    """
+    import re
+    msg = user_message
+
+    # Budget patterns
+    budget_patterns = [
+        (r"预算\s*[:：]?\s*(\d{3,5})\s*[-到~至]\s*(\d{3,5})", lambda m: f"{m.group(1)}-{m.group(2)}"),
+        (r"预算\s*[:：]?\s*(\d{3,5})", lambda m: f"{m.group(1)}-{int(m.group(1))*1.2:.0f}"),
+        (r"(\d{4})\s*[-到~至]\s*(\d{4,5})", lambda m: f"{m.group(1)}-{m.group(2)}"),
+        (r"([一二两三四五六七八九])\s*万", lambda m: f"{'一二两三四五六七八九'.index(m.group(1))*10000}-{('一二两三四五六七八九'.index(m.group(1))+1)*10000}"),
+    ]
+    for pattern, formatter in budget_patterns:
+        match = re.search(pattern, msg)
+        if match:
+            try:
+                budget = formatter(match)
+                profile_store.update(conv_id, "budget", budget, confidence=0.8, source="deduced")
+            except Exception:
+                pass
+            break
+
+    # Product category detection
+    category_map = {
+        "手机": "手机", "iPhone": "手机", "华为mate": "手机", "小米14": "手机",
+        "笔记本": "笔记本电脑", "电脑": "笔记本电脑", "游戏本": "笔记本电脑",
+        "轻薄本": "笔记本电脑", "macbook": "笔记本电脑", "thinkpad": "笔记本电脑",
+        "平板": "平板电脑", "iPad": "平板电脑", "pad": "平板电脑",
+        "耳机": "无线耳机", "airpods": "无线耳机", "降噪耳机": "无线耳机",
+        "手表": "智能手表", "手环": "智能手表", "watch": "智能手表",
+    }
+    msg_lower = msg.lower()
+    for keyword, cat_val in category_map.items():
+        if keyword.lower() in msg_lower:
+            profile_store.update(conv_id, "product_category", cat_val, confidence=0.75, source="deduced")
+            break
+
+    # Primary use detection
+    use_map = {
+        "游戏": "gaming", "打游戏": "gaming", "吃鸡": "gaming", "3a": "gaming",
+        "办公": "office", "文档": "office", "ppt": "office", "excel": "office",
+        "编程": "coding", "代码": "coding", "开发": "coding",
+        "设计": "design", "ps": "design", "pr": "design", "剪视频": "design",
+        "上课": "student", "学生": "student", "作业": "student",
+        "出差": "office", "携带": "office",
+    }
+    for keyword, use_val in use_map.items():
+        if keyword in msg_lower:
+            profile_store.update(conv_id, "primary_use", use_val, confidence=0.75, source="deduced")
+            break
+
+    # Mobility detection
+    if any(kw in msg for kw in ["出差", "携带", "通勤", "带去", "轻便", "轻薄", "经常带"]):
+        profile_store.update(conv_id, "mobility", "high", confidence=0.8, source="deduced")
+
+    # Brand preference
+    brands = ["联想", "华硕", "苹果", "华为", "惠普", "戴尔", "小米", "宏碁", "thinkpad", "macbook"]
+    for brand in brands:
+        if brand.lower() in msg_lower:
+            profile_store.update(conv_id, "preferred_brand", brand, confidence=0.7, source="deduced")
+            break
+
+    # Brand exclusion
+    for brand in brands:
+        if any(kw in msg for kw in [f"不要{brand}", f"排除{brand}", f"不买{brand}", f"除{brand}"]):
+            profile_store.update(conv_id, "exclude_brand", brand, confidence=0.8, source="deduced")
+            break

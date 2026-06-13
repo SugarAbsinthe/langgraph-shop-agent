@@ -1,0 +1,36 @@
+# ---- Secrets ----
+.env
+
+# ---- Private docs ----
+QA.md
+jianli.md
+.env.example
+docs/
+
+# ---- Generated data ----
+data/
+!data/.gitkeep
+
+# ---- Build ----
+frontend/dist/
+frontend/node_modules/
+frontend/public/icons.svg
+frontend/src/assets/
+frontend/README.md
+frontend/eslint.config.js
+
+# ---- Python ----
+venv/
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+
+# ---- IDE / tools ----
+.claude/
+.vscode/
+.idea/
+
+# ---- OS ----
+.DS_Store
+Thumbs.db
