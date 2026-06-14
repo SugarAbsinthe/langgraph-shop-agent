@@ -166,20 +166,24 @@ class ShoppingGuideGraph:
 
     def _invoke_with_retry(self, messages: list, max_retries: int = 3):
         """Invoke LLM with exponential backoff on transient failures."""
-        import time
+        import time as _time
+        from backend.logging_config import log, Timer
         last_exc = None
         for attempt in range(max_retries):
             try:
-                return self.llm_with_tools.invoke(messages)
+                with Timer("llm_call", attempt=attempt + 1):
+                    result = self.llm_with_tools.invoke(messages)
+                return result
             except Exception as e:
                 last_exc = e
-                # Only retry on transient errors
                 err_str = str(e).lower()
                 if not any(kw in err_str for kw in ("timeout", "rate limit", "429", "connection", "reset", "503", "502")):
                     raise
                 if attempt < max_retries - 1:
                     delay = 2 ** attempt  # 1s, 2s, 4s
-                    time.sleep(delay)
+                    log("llm_retry", attempt=attempt + 2, delay=delay)
+                    _time.sleep(delay)
+        log("llm_fail", attempts=max_retries, error=str(last_exc)[:100])
         raise last_exc
 
     def _agent_node(self, state: ShoppingState) -> dict:

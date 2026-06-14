@@ -35,6 +35,8 @@ class ProductRetriever:
         if self._cache is not None and filters is None:
             cached = self._cache.get(query, top_k)
             if cached is not None:
+                from backend.logging_config import log
+                log("rag_cache_hit", query=query[:80].replace('\n', ' '))
                 return cached
 
         where = None

@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import asyncio
 import json as _json
-import logging
 
 from fastapi import APIRouter, HTTPException
 from fastapi.responses import StreamingResponse
@@ -12,8 +11,7 @@ from langchain.schema import HumanMessage, AIMessage
 
 from backend.dependencies import get_agent
 from backend.schemas import ChatRequest, ChatResponse
-
-logger = logging.getLogger(__name__)
+from backend.logging_config import log, Timer
 
 router = APIRouter(tags=["chat"])
 
@@ -45,25 +43,28 @@ async def chat(request: ChatRequest):
     if agent is None:
         raise HTTPException(status_code=503, detail="Agent not initialized")
 
+    log("request_start", conv_id=request.conv_id, msg_len=len(request.question))
     history = _build_chat_history(request.chat_history)
 
     try:
-        result = await asyncio.wait_for(
-            asyncio.get_event_loop().run_in_executor(
-                None,
-                lambda: agent.run(
-                    question=request.question,
-                    conv_id=request.conv_id,
-                    chat_history=history,
-                )
-            ),
-            timeout=_AGENT_TIMEOUT,
-        )
+        with Timer("agent_run"):
+            result = await asyncio.wait_for(
+                asyncio.get_event_loop().run_in_executor(
+                    None,
+                    lambda: agent.run(
+                        question=request.question,
+                        conv_id=request.conv_id,
+                        chat_history=history,
+                    )
+                ),
+                timeout=_AGENT_TIMEOUT,
+            )
+        log("request_end", stage=result.get("stage"), tool_rounds=result.get("tool_rounds"))
     except asyncio.TimeoutError:
-        logger.error("Agent timeout for conv_id=%s after %ds", request.conv_id, _AGENT_TIMEOUT)
+        log("request_timeout", conv_id=request.conv_id, timeout=_AGENT_TIMEOUT)
         raise HTTPException(status_code=504, detail="Agent response timed out, please try again")
     except Exception as e:
-        logger.exception("Agent execution failed for conv_id=%s", request.conv_id)
+        log("request_error", error=str(e)[:200])
         raise HTTPException(status_code=500, detail=f"Agent execution failed: {e}")
 
     return ChatResponse(
@@ -77,15 +78,12 @@ async def chat(request: ChatRequest):
 
 @router.post("/chat/stream")
 async def chat_stream(request: ChatRequest):
-    """Send a message to the Agent and stream the response via SSE.
-
-    Events: stage | status | token | done | error
-    The client should use EventSource or fetch + ReadableStream to consume.
-    """
+    """Send a message to the Agent and stream the response via SSE."""
     agent = get_agent()
     if agent is None:
         raise HTTPException(status_code=503, detail="Agent not initialized")
 
+    log("stream_start", conv_id=request.conv_id, msg_len=len(request.question))
     history = _build_chat_history(request.chat_history)
 
     async def _event_generator():
@@ -96,8 +94,9 @@ async def chat_stream(request: ChatRequest):
                 chat_history=history,
             ):
                 yield sse_msg
+            log("stream_end")
         except Exception as exc:
-            logger.exception("Streaming failed for conv_id=%s", request.conv_id)
+            log("stream_error", error=str(exc)[:200])
             yield _format_sse("error", {"message": str(exc)})
 
     return StreamingResponse(
