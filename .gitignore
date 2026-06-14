@@ -4,7 +4,6 @@
 # ---- Private docs ----
 QA.md
 jianli.md
-.env.example
 docs/
 
 # ---- Generated data ----
