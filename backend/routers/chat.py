@@ -35,6 +35,9 @@ def _format_sse(event: str, data: dict | str) -> str:
     return f"event: {event}\ndata: {payload}\n\n"
 
 
+_AGENT_TIMEOUT = 60  # seconds
+
+
 @router.post("/chat", response_model=ChatResponse)
 async def chat(request: ChatRequest):
     """Send a message to the shopping guide Agent (non-streaming)."""
@@ -45,14 +48,20 @@ async def chat(request: ChatRequest):
     history = _build_chat_history(request.chat_history)
 
     try:
-        result = await asyncio.get_event_loop().run_in_executor(
-            None,
-            lambda: agent.run(
-                question=request.question,
-                conv_id=request.conv_id,
-                chat_history=history,
-            )
+        result = await asyncio.wait_for(
+            asyncio.get_event_loop().run_in_executor(
+                None,
+                lambda: agent.run(
+                    question=request.question,
+                    conv_id=request.conv_id,
+                    chat_history=history,
+                )
+            ),
+            timeout=_AGENT_TIMEOUT,
         )
+    except asyncio.TimeoutError:
+        logger.error("Agent timeout for conv_id=%s after %ds", request.conv_id, _AGENT_TIMEOUT)
+        raise HTTPException(status_code=504, detail="Agent response timed out, please try again")
     except Exception as e:
         logger.exception("Agent execution failed for conv_id=%s", request.conv_id)
         raise HTTPException(status_code=500, detail=f"Agent execution failed: {e}")

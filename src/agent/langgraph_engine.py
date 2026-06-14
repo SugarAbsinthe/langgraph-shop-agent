@@ -164,6 +164,24 @@ class ShoppingGuideGraph:
 
         return {"product_context": product_context}
 
+    def _invoke_with_retry(self, messages: list, max_retries: int = 3):
+        """Invoke LLM with exponential backoff on transient failures."""
+        import time
+        last_exc = None
+        for attempt in range(max_retries):
+            try:
+                return self.llm_with_tools.invoke(messages)
+            except Exception as e:
+                last_exc = e
+                # Only retry on transient errors
+                err_str = str(e).lower()
+                if not any(kw in err_str for kw in ("timeout", "rate limit", "429", "connection", "reset", "503", "502")):
+                    raise
+                if attempt < max_retries - 1:
+                    delay = 2 ** attempt  # 1s, 2s, 4s
+                    time.sleep(delay)
+        raise last_exc
+
     def _agent_node(self, state: ShoppingState) -> dict:
         stage = state.get("stage", "discovery")
         user_profile = state.get("user_profile", "(暂无画像)")
@@ -183,7 +201,7 @@ class ShoppingGuideGraph:
         # Prepare messages for LLM: system + conversation
         full_messages = [SystemMessage(content=system_text)] + list(state["messages"])
 
-        response = self.llm_with_tools.invoke(full_messages)
+        response = self._invoke_with_retry(full_messages)
 
         return {
             "messages": [response],
@@ -272,10 +290,13 @@ class ShoppingGuideGraph:
             return f"event: {event_type}\ndata: {_json.dumps(data, ensure_ascii=False)}\n\n"
 
         try:
-            # Run sync graph in thread pool (non-blocking)
+            # Run sync graph in thread pool (non-blocking) with timeout
             yield _emit("status", {"message": "正在分析需求..."})
-            result = await asyncio.get_event_loop().run_in_executor(
-                None, lambda: self.graph.invoke(initial_state)
+            result = await asyncio.wait_for(
+                asyncio.get_event_loop().run_in_executor(
+                    None, lambda: self.graph.invoke(initial_state)
+                ),
+                timeout=60,
             )
 
             # Extract answer and metadata
@@ -306,6 +327,8 @@ class ShoppingGuideGraph:
                 "user_profile": result.get("user_profile", ""),
             })
 
+        except asyncio.TimeoutError:
+            yield _emit("error", {"message": "请求超时，请稍后重试"})
         except Exception as exc:
             yield _emit("error", {"message": str(exc)})
 
