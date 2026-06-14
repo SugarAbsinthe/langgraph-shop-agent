@@ -269,13 +269,15 @@ class ShoppingGuideGraph:
 
     async def run_stream(self, user_message: str, conv_id: str,
                          chat_history: list = None):
-        """Async generator: yields SSE-formatted strings for streaming.
+        """Async generator: emits SSE events as the graph progresses.
 
-        Runs the sync graph, then streams the answer token by token
-        with status events to simulate real-time feedback.
+        Uses graph.astream() to yield after each node. Status events
+        indicate phase transitions; token events carry the final assistant
+        response progressively.
         """
         import asyncio
         import json as _json
+        import re
 
         initial_state = {
             "messages": (chat_history or []) + [HumanMessage(content=user_message)],
@@ -293,42 +295,42 @@ class ShoppingGuideGraph:
         def _emit(event_type, data):
             return f"event: {event_type}\ndata: {_json.dumps(data, ensure_ascii=False)}\n\n"
 
+        final_stage = "discovery"
+        final_tool_rounds = 0
+        seen_contents = set()
+
         try:
-            # Run sync graph in thread pool (non-blocking) with timeout
-            yield _emit("status", {"message": "正在分析需求..."})
-            result = await asyncio.wait_for(
-                asyncio.get_event_loop().run_in_executor(
-                    None, lambda: self.graph.invoke(initial_state)
-                ),
-                timeout=60,
-            )
+            async for chunk in self.graph.astream(initial_state, stream_mode="updates"):
+                for node_name, node_output in chunk.items():
+                    if node_name == "analyze":
+                        final_stage = node_output.get("stage", final_stage)
+                        yield _emit("stage", {"stage": final_stage})
 
-            # Extract answer and metadata
-            answer = ""
-            for m in reversed(result.get("messages", [])):
-                if isinstance(m, AIMessage) and m.content:
-                    answer = m.content
-                    break
+                    elif node_name == "retrieve":
+                        if node_output.get("product_context", ""):
+                            yield _emit("status", {"message": "已找到相关产品"})
 
-            stage = result.get("stage", "discovery")
-            tool_rounds = result.get("tool_rounds", 0)
-            yield _emit("stage", {"stage": stage})
+                    elif node_name == "tools":
+                        yield _emit("status", {"message": "正在分析结果..."})
 
-            # Stream answer token by token for visual effect
-            if answer:
-                # Send in sentence-sized chunks for natural pacing
-                import re
-                chunks = re.split(r'(?<=[。！？\n])', answer)
-                for chunk in chunks:
-                    if chunk:
-                        yield _emit("token", {"content": chunk})
-                        await asyncio.sleep(0.02)  # small delay for visual pacing
+                    elif node_name == "agent":
+                        final_tool_rounds = node_output.get("tool_rounds", final_tool_rounds)
+                        for m in node_output.get("messages", []):
+                            if not isinstance(m, AIMessage) or not m.content:
+                                continue
+                            if m.tool_calls:
+                                names = [tc.get("name", "") for tc in m.tool_calls]
+                                yield _emit("status", {"message": f"正在调用: {', '.join(names)}"})
+                            elif m.content not in seen_contents:
+                                seen_contents.add(m.content)
+                                for chunk_text in re.split(r'(?<=[。！？\n])', m.content):
+                                    if chunk_text.strip():
+                                        yield _emit("token", {"content": chunk_text})
+                                        await asyncio.sleep(0.01)
 
             yield _emit("done", {
-                "stage": stage,
-                "tool_rounds": tool_rounds,
-                "product_context": result.get("product_context", ""),
-                "user_profile": result.get("user_profile", ""),
+                "stage": final_stage,
+                "tool_rounds": final_tool_rounds,
             })
 
         except asyncio.TimeoutError:
