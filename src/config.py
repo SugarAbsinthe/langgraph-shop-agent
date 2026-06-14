@@ -141,24 +141,26 @@ config = Config()
 
 
 def ensure_hf_offline_if_needed(timeout: float = 3.0) -> bool:
-    """Test HuggingFace connectivity; set offline mode if unreachable.
+    """Test HuggingFace connectivity via HTTP HEAD; set offline if unreachable.
+
+    Uses a real HTTP request (not just TCP connect) to detect proxy
+    scenarios where port 443 is open but HuggingFace is still blocked.
 
     Returns True if offline mode was enabled, False if network is available.
-    Call this early in the entry point, before importing sentence-transformers.
     """
     import logging
     logger = logging.getLogger(__name__)
 
-    # Already set by user — respect their choice
     if os.environ.get("HF_HUB_OFFLINE") == "1":
         return True
 
-    import socket
+    import urllib.request
     try:
-        socket.create_connection(("huggingface.co", 443), timeout=timeout)
+        req = urllib.request.Request("https://huggingface.co", method="HEAD")
+        urllib.request.urlopen(req, timeout=timeout)
         logger.info("HuggingFace reachable — online mode")
         return False
-    except (socket.timeout, OSError):
+    except Exception:
         os.environ["HF_HUB_OFFLINE"] = "1"
         os.environ["TRANSFORMERS_OFFLINE"] = "1"
         logger.info("HuggingFace unreachable — switched to offline mode")
