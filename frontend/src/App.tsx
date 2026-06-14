@@ -13,6 +13,7 @@ export default function App() {
     newConversation,
     removeConversation,
     sendMessage,
+    cancel,
   } = useChat();
 
   const didInit = useRef(false);
@@ -80,6 +81,7 @@ export default function App() {
             messages={state.messages}
             isLoading={state.isLoading}
             onSend={sendMessage}
+            onCancel={cancel}
           />
 
           <DebugPanel

@@ -1,4 +1,4 @@
-import { useReducer, useCallback, useEffect } from "react";
+import { useReducer, useCallback, useEffect, useRef } from "react";
 import type { Conversation, ChatMessage, MessageRecord } from "../types";
 import * as api from "../api/client";
 
@@ -160,10 +160,17 @@ export function useChat() {
     }
   }, []);
 
+  const abortRef = useRef<AbortController | null>(null);
+
   /* Send a message (streaming) */
   const sendMessage = useCallback(async (question: string) => {
     const convId = state.currentConvId;
     if (!convId || !question.trim()) return;
+
+    /* Cancel any in-flight request */
+    abortRef.current?.abort();
+    const controller = new AbortController();
+    abortRef.current = controller;
 
     dispatch({ type: "SET_LOADING", payload: true });
     dispatch({ type: "SET_ERROR", payload: null });
@@ -212,7 +219,7 @@ export function useChat() {
         onError(message) {
           dispatch({ type: "SET_ERROR", payload: message });
         },
-      });
+      }, controller.signal);
 
       /* Refresh conversation list (title may have changed) */
       const convs = await api.listConversations();
@@ -224,6 +231,11 @@ export function useChat() {
     }
   }, [state.currentConvId, state.messages, state.lastProfile, state.lastProductContext]);
 
+  const cancel = useCallback(() => {
+    abortRef.current?.abort();
+    dispatch({ type: "SET_LOADING", payload: false });
+  }, []);
+
   return {
     state,
     dispatch,
@@ -231,5 +243,6 @@ export function useChat() {
     newConversation,
     removeConversation,
     sendMessage,
+    cancel,
   };
 }

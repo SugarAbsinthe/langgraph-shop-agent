@@ -53,6 +53,7 @@ export async function sendMessageStream(
   question: string,
   chatHistory: { role: string; content: string }[],
   callbacks: StreamCallbacks,
+  signal?: AbortSignal,
 ): Promise<void> {
   const res = await fetch("/api/chat/stream", {
     method: "POST",
@@ -62,6 +63,7 @@ export async function sendMessageStream(
       question,
       chat_history: chatHistory,
     }),
+    signal,
   });
 
   if (!res.ok) {

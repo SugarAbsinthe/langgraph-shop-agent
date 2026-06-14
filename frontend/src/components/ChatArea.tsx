@@ -1,5 +1,5 @@
 import { useState, useRef, useEffect } from "react";
-import { Send, Loader2, Sparkles, ArrowUp } from "lucide-react";
+import { ArrowUp, Sparkles, Square } from "lucide-react";
 import MessageBubble from "./MessageBubble";
 
 interface DisplayMessage {
@@ -11,6 +11,7 @@ interface ChatAreaProps {
   messages: DisplayMessage[];
   isLoading: boolean;
   onSend: (question: string) => void;
+  onCancel?: () => void;
   showQuickChips?: boolean;
 }
 
@@ -25,6 +26,7 @@ export default function ChatArea({
   messages,
   isLoading,
   onSend,
+  onCancel,
   showQuickChips = true,
 }: ChatAreaProps) {
   const [input, setInput] = useState("");
@@ -107,13 +109,23 @@ export default function ChatArea({
             disabled={isLoading}
             className="flex-1 resize-none bg-transparent text-sm outline-none py-1.5 placeholder:text-slate-400 disabled:opacity-50"
           />
-          <button
-            onClick={handleSubmit}
-            disabled={isLoading || !input.trim()}
-            className="shrink-0 w-9 h-9 rounded-xl bg-indigo-500 text-white hover:bg-indigo-600 disabled:opacity-30 disabled:cursor-not-allowed transition-all flex items-center justify-center shadow-sm"
-          >
-            <ArrowUp size={17} />
-          </button>
+          {isLoading ? (
+            <button
+              onClick={onCancel}
+              className="shrink-0 w-9 h-9 rounded-xl bg-red-500 text-white hover:bg-red-600 transition-all flex items-center justify-center shadow-sm"
+              title="停止生成"
+            >
+              <Square size={14} fill="currentColor" />
+            </button>
+          ) : (
+            <button
+              onClick={handleSubmit}
+              disabled={!input.trim()}
+              className="shrink-0 w-9 h-9 rounded-xl bg-indigo-500 text-white hover:bg-indigo-600 disabled:opacity-30 disabled:cursor-not-allowed transition-all flex items-center justify-center shadow-sm"
+            >
+              <ArrowUp size={17} />
+            </button>
+          )}
         </div>
       </div>
     </div>
