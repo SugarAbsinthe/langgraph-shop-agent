@@ -7,6 +7,14 @@ Four-node graph:
   tools    — ToolNode executes tool calls
 
 Flow: analyze → retrieve → agent ⇄ tools → END
+
+Why four nodes instead of flattening everything into one:
+  - analyze and retrieve are rule-driven, deterministic steps — keeping them
+    separate makes behavior predictable and debuggable
+  - agent and tools are the LLM-driven loop — isolating them prevents the
+    deterministic steps from being re-executed every tool round
+  - The conditional edge (agent → tools or END) is the key control point:
+    agent decides "do I need more info?" and the graph enforces the limit
 """
 
 from typing import Annotated, TypedDict, Literal
@@ -165,7 +173,13 @@ class ShoppingGuideGraph:
         return {"product_context": product_context}
 
     def _invoke_with_retry(self, messages: list, max_retries: int = 3):
-        """Invoke LLM with exponential backoff on transient failures."""
+        """Invoke LLM with exponential backoff on transient failures.
+
+        Only retries on infrastructure errors (timeout, rate limit, connection
+        reset, 502/503). Does NOT retry on model-level errors (bad request,
+        context too long) — those need code or prompt fixes, not retries.
+        Delay: 1s → 2s → 4s (3 attempts max).
+        """
         import time as _time
         from backend.logging_config import log, Timer
         last_exc = None
@@ -245,6 +259,13 @@ class ShoppingGuideGraph:
     # ---- Routing ----
 
     def _route_after_agent(self, state: ShoppingState) -> Literal["tools", "end"]:
+        """Route after agent node: continue to tools if LLM requested tool calls
+        and we haven't hit the limit. Otherwise end the turn.
+
+        The max_tool_rounds cap (default 3) prevents infinite agent-tool loops.
+        When exceeded, the graph ends even if tool_calls are pending — _agent_node
+        is responsible for producing a usable response before the limit.
+        """
         messages = state["messages"]
         tool_rounds = state.get("tool_rounds", 0)
 
@@ -377,9 +398,11 @@ def classify_stage(user_message: str, current_stage: str, llm=None,
                    stage_classifier_prompt: str = "") -> str:
     """Classify the conversation stage.
 
-    Uses regex keyword heuristics first (~70% coverage), falls back to
-    LLM classification for ambiguous cases. Callable from both
-    ShoppingGuideGraph and SupervisorGraph.
+    Rule-first strategy: regex keywords cover ~70% of real-world inputs
+    (zero latency, zero cost). LLM only invoked for ambiguous cases.
+    This is a cost-latency-accuracy tradeoff: rules are fast and predictable
+    but brittle; LLM is flexible but costs a call. The right balance depends
+    on how well your keywords match your actual user input patterns.
     """
     if not user_message:
         return current_stage or "discovery"

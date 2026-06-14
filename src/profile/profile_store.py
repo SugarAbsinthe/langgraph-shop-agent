@@ -102,6 +102,12 @@ class ProfileStore:
 
         Applies time decay: effective_confidence = confidence * exp(-λ * days).
         Entries with effective confidence below 0.15 are excluded.
+
+        Why decay instead of hard expiration:
+          Hard expiration creates a cliff — a 29-day-old preference is "valid"
+          and a 31-day-old one is "gone". Time decay is continuous: preferences
+          fade gradually, matching how real user preferences change. A 2-week-old
+          budget matters less than a 2-hour-old one, but it's not worthless.
         """
         conn = sqlite3.connect(self.db_path)
         rows = conn.execute(

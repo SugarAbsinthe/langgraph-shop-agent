@@ -1,11 +1,18 @@
 """Product retriever for shopping guide Agent.
 
 Three-level retrieval pipeline:
-  1. Query product_descriptions for overall product matches
-  2. Query product_specs for attribute-level matching
-  3. Query product_reviews for relevant user feedback
+  1. product_descriptions — semantic match on full product descriptions
+  2. product_specs — attribute-level matching for specific requirements
+     (e.g. "RTX 4060" may match a spec row even if the description doesn't
+     explicitly mention it)
+  3. product_reviews — user feedback filtered to already-matched products
 
-The result is formatted as a structured context block for the LLM prompt.
+Why three levels instead of one:
+  A single collection would force a choice between broad coverage (descriptions
+  are vague) and precision (specs are specific but lose context). Layering lets
+  each collection do what it's best at: descriptions for initial recall, specs
+  to catch missed matches, reviews for qualitative signal. The product_id-based
+  dedup across levels keeps the final result set clean.
 """
 import json
 import sqlite3

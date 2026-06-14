@@ -245,7 +245,11 @@ SHOPPING_TOOLS = [
 ]
 
 
-# ---- Factory functions: dependency-injected tools for multi-agent workers ----
+# ---- Factory functions ----
+# Each factory returns an @tool whose dependencies (retriever, db path, etc.)
+# are captured via closure rather than stored in module-level globals.
+# This eliminates the init_shopping_tools() pattern and makes tools testable
+# with mock dependencies without monkey-patching.
 
 def create_search_products(product_retriever):
     """Factory: returns a search_products tool closing over a specific retriever."""
