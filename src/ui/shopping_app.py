@@ -125,7 +125,7 @@ def load_messages(conv_id: str) -> list[dict]:
 
 
 def build_chat_history(conv_id: str) -> list:
-    from langchain.schema import HumanMessage, AIMessage
+    from langchain_core.messages import HumanMessage, AIMessage
     msgs = CONV_STORE.get_messages(conv_id)
     history = []
     for m in msgs:
@@ -457,7 +457,7 @@ if question := st.chat_input("说说你的需求..."):
 
                 with tab3:
                     messages_all = result.get("messages", [])
-                    from langchain.schema import AIMessage as AIm
+                    from langchain_core.messages import AIMessage as AIm
                     tool_msgs = [
                         m for m in messages_all
                         if isinstance(m, AIm) and hasattr(m, "tool_calls") and m.tool_calls

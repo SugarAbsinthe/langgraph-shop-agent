@@ -1,7 +1,12 @@
-"""Test LangGraph routing and node logic (no LLM calls)."""
+"""Test LangGraph routing and node logic without external LLM calls."""
+import asyncio
+import json
 import pytest
 from unittest.mock import Mock, MagicMock
-from langchain_core.messages import AIMessage, HumanMessage
+from langchain_core.language_models.chat_models import BaseChatModel
+from langchain_core.messages import AIMessage, AIMessageChunk, HumanMessage, ToolMessage
+from langchain_core.outputs import ChatGeneration, ChatGenerationChunk, ChatResult
+from langchain_core.tools import tool
 from src.agent.langgraph_engine import ShoppingGuideGraph, ShoppingState, classify_stage
 
 
@@ -66,7 +71,7 @@ class TestGraphRouting:
             "tool_rounds": 3,
         }
         result = graph._route_after_agent(state)
-        assert result == "end"
+        assert result == "finalize"
 
     def test_route_without_tool_calls(self):
         graph = _make_graph()
@@ -103,3 +108,246 @@ def _make_graph(max_tool_rounds=3):
         stage_classifier_prompt="test",
         max_tool_rounds=max_tool_rounds,
     )
+
+
+class FakeToolLLM:
+    """Deterministic model double for graph lifecycle tests."""
+
+    def __init__(self, responses):
+        self.responses = list(responses)
+        self.calls = 0
+
+    def bind_tools(self, tools):
+        return self
+
+    def invoke(self, messages):
+        response = self.responses[min(self.calls, len(self.responses) - 1)]
+        self.calls += 1
+        return response
+
+
+class StreamingFakeLLM(BaseChatModel):
+    chunks: list[str]
+
+    @property
+    def _llm_type(self):
+        return "streaming-fake"
+
+    def bind_tools(self, tools, **kwargs):
+        return self
+
+    def _generate(self, messages, stop=None, run_manager=None, **kwargs):
+        return ChatResult(generations=[
+            ChatGeneration(message=AIMessage(content="".join(self.chunks)))
+        ])
+
+    def _stream(self, messages, stop=None, run_manager=None, **kwargs):
+        for chunk in self.chunks:
+            yield ChatGenerationChunk(message=AIMessageChunk(content=chunk))
+
+
+class FakeRetriever:
+    def retrieve(self, query, top_k=5):
+        return "context"
+
+
+class FakeProfileStore:
+    def serialize_profile(self, conv_id):
+        return "(暂无画像)"
+
+    def update(self, *args, **kwargs):
+        return None
+
+
+def _lifecycle_graph(responses, max_tool_rounds=3):
+    llm = FakeToolLLM(responses)
+    graph = ShoppingGuideGraph(
+        llm=llm,
+        tools=[],
+        product_retriever=FakeRetriever(),
+        profile_store=FakeProfileStore(),
+        system_prompt="test {conv_id} {stage} {user_profile} {product_context}",
+        stage_classifier_prompt="",
+        max_tool_rounds=max_tool_rounds,
+    )
+    return graph, llm
+
+
+def test_graph_completes_without_tools():
+    graph, _ = _lifecycle_graph([AIMessage(content="final")])
+    result = graph.run("hello", "conv-1")
+    assert result["messages"][-1].content == "final"
+    assert result["tool_rounds"] == 0
+    assert result["stop_reason"] == "completed"
+
+
+def test_graph_finalizes_when_tool_round_limit_is_reached():
+    first_tool_call = _make_tool_call_msg("call_1")
+    second_tool_call = _make_tool_call_msg("call_2")
+    graph, llm = _lifecycle_graph(
+        [first_tool_call, second_tool_call, AIMessage(content="final after limit")],
+        max_tool_rounds=1,
+    )
+    result = graph.run("find a laptop", "conv-2")
+    assert result["messages"][-1].content == "final after limit"
+    assert result["tool_rounds"] == 1
+    assert result["stop_reason"] == "max_tool_rounds"
+    assert llm.calls == 3
+    assert isinstance(result["messages"][-2], ToolMessage)
+    assert result["messages"][-2].tool_call_id == "call_2"
+
+
+def test_graph_reports_tool_error_and_still_finalizes():
+    tool_call = _make_tool_call_msg()
+    graph, _ = _lifecycle_graph([tool_call, AIMessage(content="fallback")], max_tool_rounds=1)
+    result = graph.run("find a laptop", "conv-3")
+    assert result["messages"][-1].content == "fallback"
+    assert result["stop_reason"] == "tool_error"
+
+
+def test_checkpoint_preserves_stage_across_graph_instances(tmp_path):
+    checkpoint_path = str(tmp_path / "agent-checkpoints.db")
+    first_llm = FakeToolLLM([AIMessage(content="first")])
+    first = ShoppingGuideGraph(
+        llm=first_llm,
+        tools=[],
+        product_retriever=FakeRetriever(),
+        profile_store=FakeProfileStore(),
+        system_prompt="test {conv_id} {stage} {user_profile} {product_context}",
+        stage_classifier_prompt="",
+        checkpoint_db_path=checkpoint_path,
+    )
+    first_result = first.run("推荐游戏本", "persistent-conv")
+    assert first_result["stage"] == "search"
+    first.close()
+
+    second_llm = FakeToolLLM([AIMessage(content="second")])
+    second = ShoppingGuideGraph(
+        llm=second_llm,
+        tools=[],
+        product_retriever=FakeRetriever(),
+        profile_store=FakeProfileStore(),
+        system_prompt="test {conv_id} {stage} {user_profile} {product_context}",
+        stage_classifier_prompt="",
+        checkpoint_db_path=checkpoint_path,
+    )
+    second_result = second.run("这个呢", "persistent-conv")
+    assert second_result["stage"] == "search"
+    second.clear_thread("persistent-conv")
+    second.close()
+
+    third_llm = FakeToolLLM([AIMessage(content="third")])
+    third = ShoppingGuideGraph(
+        llm=third_llm,
+        tools=[],
+        product_retriever=FakeRetriever(),
+        profile_store=FakeProfileStore(),
+        system_prompt="test {conv_id} {stage} {user_profile} {product_context}",
+        stage_classifier_prompt="",
+        checkpoint_db_path=checkpoint_path,
+    )
+    reset_result = third.run("这个呢", "persistent-conv")
+    assert reset_result["stage"] == "discovery"
+    third.close()
+
+
+def test_run_stream_emits_real_model_chunks_and_complete_metadata(tmp_path):
+    llm = StreamingFakeLLM(chunks=["first", "-second"])
+    graph = ShoppingGuideGraph(
+        llm=llm,
+        tools=[],
+        product_retriever=FakeRetriever(),
+        profile_store=FakeProfileStore(),
+        system_prompt="test {conv_id} {stage} {user_profile} {product_context}",
+        stage_classifier_prompt="",
+        checkpoint_db_path=str(tmp_path / "stream-checkpoints.db"),
+    )
+
+    async def collect():
+        return [event async for event in graph.run_stream("hello", "stream-conv")]
+
+    events = asyncio.run(collect())
+    token_payloads = [
+        json.loads(event.split("data: ", 1)[1])
+        for event in events if event.startswith("event: token")
+    ]
+    done_payload = json.loads(
+        next(event for event in events if event.startswith("event: done")).split("data: ", 1)[1]
+    )
+    assert [payload["content"] for payload in token_payloads] == ["first", "-second"]
+    assert done_payload["stop_reason"] == "completed"
+    assert done_payload["agent_rounds"] == 1
+    assert done_payload["run_id"]
+    assert done_payload["latency_ms"] >= 0
+    assert "user_profile" in done_payload
+    assert "product_context" in done_payload
+    graph.close()
+
+
+def test_sync_and_stream_paths_produce_the_same_answer(tmp_path):
+    sync_graph = ShoppingGuideGraph(
+        llm=StreamingFakeLLM(chunks=["same", " answer"]),
+        tools=[],
+        product_retriever=FakeRetriever(),
+        profile_store=FakeProfileStore(),
+        system_prompt="test {conv_id} {stage} {user_profile} {product_context}",
+        stage_classifier_prompt="",
+        checkpoint_db_path=str(tmp_path / "sync.db"),
+    )
+    sync_result = sync_graph.run("hello", "sync-conv")
+
+    stream_graph = ShoppingGuideGraph(
+        llm=StreamingFakeLLM(chunks=["same", " answer"]),
+        tools=[],
+        product_retriever=FakeRetriever(),
+        profile_store=FakeProfileStore(),
+        system_prompt="test {conv_id} {stage} {user_profile} {product_context}",
+        stage_classifier_prompt="",
+        checkpoint_db_path=str(tmp_path / "stream.db"),
+    )
+
+    async def collect():
+        return [event async for event in stream_graph.run_stream("hello", "stream-conv")]
+
+    events = asyncio.run(collect())
+    stream_answer = "".join(
+        json.loads(event.split("data: ", 1)[1])["content"]
+        for event in events if event.startswith("event: token")
+    )
+    assert stream_answer == sync_result["messages"][-1].content == "same answer"
+    sync_graph.close()
+    stream_graph.close()
+
+
+def test_run_stream_emits_tool_lifecycle_events(tmp_path):
+    @tool
+    def search(query: str) -> str:
+        """Search a test catalog."""
+        return "found"
+
+    llm = FakeToolLLM([
+        _make_tool_call_msg(tool_name="search"),
+        AIMessage(content="done"),
+    ])
+    graph = ShoppingGuideGraph(
+        llm=llm,
+        tools=[search],
+        product_retriever=FakeRetriever(),
+        profile_store=FakeProfileStore(),
+        system_prompt="test {conv_id} {stage} {user_profile} {product_context}",
+        stage_classifier_prompt="",
+        checkpoint_db_path=str(tmp_path / "tool-events.db"),
+    )
+
+    async def collect():
+        return [event async for event in graph.run_stream("hello", "tool-conv")]
+
+    events = asyncio.run(collect())
+    assert any(event.startswith("event: tool_start") for event in events)
+    assert any(event.startswith("event: tool_end") for event in events)
+    done = json.loads(
+        next(event for event in events if event.startswith("event: done")).split("data: ", 1)[1]
+    )
+    assert done["tool_rounds"] == 1
+    assert done["stop_reason"] == "completed"
+    graph.close()

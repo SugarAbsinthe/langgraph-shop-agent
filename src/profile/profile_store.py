@@ -134,6 +134,10 @@ class ProfileStore:
         conn.execute("DELETE FROM user_profiles WHERE conv_id = ?", (conv_id,))
         conn.commit()
         conn.close()
+        try:
+            self.memory_col.delete(where={"conv_id": conv_id})
+        except Exception:
+            pass
 
     # ---- Semantic Memory ----
 

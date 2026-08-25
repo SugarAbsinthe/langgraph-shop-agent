@@ -131,7 +131,7 @@ STAGE_CLASSIFIER_PROMPT = """你是一个对话阶段分类器。根据用户最
 请只回复阶段名称（一个单词），不要其他内容。"""
 
 
-# ---- Per-agent prompts (multi-agent architecture) ----
+# ---- Stage-specific prompts ----
 
 COMMON_STYLE_GUIDE = """
 ## 对话风格
@@ -185,7 +185,7 @@ DISCOVERY_AGENT_PROMPT = """你是一个专业的导购需求挖掘助手。你�
 - 如果已有画像，主动说"上次你提到……这次还是差不多的需求吗？"
 - 追问关键信息：预算、使用场景、品牌偏好、硬性要求
 - 每获得一个新信息就 update_user_profile
-- 挖掘 3-4 个关键维度后就可以让 Supervisor 进入搜索阶段
+- 挖掘 3-4 个关键维度后即可进入搜索阶段
 """ + COMMON_STYLE_GUIDE
 
 SEARCH_AGENT_PROMPT = """你是一个专业的产品搜索助手。你的任务是根据明确的用户需求搜索并展示匹配的产品。

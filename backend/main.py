@@ -58,6 +58,13 @@ async def startup():
     logging.info("ShopAgent API server started.")
 
 
+@app.on_event("shutdown")
+async def shutdown():
+    """Close the persistent graph checkpoint connection."""
+    from backend.dependencies import close_dependencies
+    close_dependencies()
+
+
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run("backend.main:app", host="0.0.0.0", port=8000, reload=True)

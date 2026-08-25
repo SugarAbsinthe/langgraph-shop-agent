@@ -4,7 +4,7 @@ from pathlib import Path
 from typing import Any
 
 from dotenv import load_dotenv
-from langchain.schema import AIMessage
+from langchain_core.messages import AIMessage
 
 BASE_DIR = Path(__file__).resolve().parent.parent
 load_dotenv(BASE_DIR / ".env")
@@ -20,6 +20,9 @@ class Config:
     PRODUCT_DB_PATH: str = os.getenv("PRODUCT_DB_PATH", str(BASE_DIR / "data" / "products.db"))
     PROFILE_DB_PATH: str = os.getenv("PROFILE_DB_PATH", str(BASE_DIR / "data" / "profiles.db"))
     CONV_DB_PATH: str = os.getenv("CONV_DB_PATH", str(BASE_DIR / "data" / "conversations.db"))
+    AGENT_CHECKPOINT_DB_PATH: str = os.getenv(
+        "AGENT_CHECKPOINT_DB_PATH", str(BASE_DIR / "data" / "agent_checkpoints.db")
+    )
 
     # ChromaDB
     PRODUCT_CHROMA_DIR: str = os.getenv("PRODUCT_CHROMA_DIR", str(BASE_DIR / "data" / "product_chroma_db"))

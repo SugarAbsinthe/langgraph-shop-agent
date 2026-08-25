@@ -1,59 +1,65 @@
 """LangGraph state machine for the shopping guide Agent.
 
-Four-node graph:
+Five-node graph:
   analyze  — load profile, classify stage, extract new profile signals
   retrieve — profile-augmented product search
-  agent    — LLM with tools (loops max 3 rounds via tools node)
+  agent    — LLM with tools and stage-specific prompt
   tools    — ToolNode executes tool calls
+  finalize — tool-free answer when the loop reaches its configured limit
 
-Flow: analyze → retrieve → agent ⇄ tools → END
+Flow: analyze → retrieve → agent ⇄ tools → END, or agent → finalize → END
 
-Why four nodes instead of flattening everything into one:
+Why separate nodes instead of flattening everything into one:
   - analyze and retrieve are rule-driven, deterministic steps — keeping them
     separate makes behavior predictable and debuggable
   - agent and tools are the LLM-driven loop — isolating them prevents the
     deterministic steps from being re-executed every tool round
-  - The conditional edge (agent → tools or END) is the key control point:
-    agent decides "do I need more info?" and the graph enforces the limit
+  - The conditional edge after agent is the key control point: the model can
+    request tools, finish normally, or be routed to a safe final response
 """
 
+import asyncio
+import sqlite3
+import threading
+from pathlib import Path
 from typing import Annotated, TypedDict, Literal
 
 from langgraph.graph import StateGraph, END
 from langgraph.graph.message import add_messages
 from langgraph.prebuilt import ToolNode
-from langchain.schema import SystemMessage, HumanMessage, AIMessage
+from langgraph.checkpoint.sqlite import SqliteSaver
+from langchain_core.messages import SystemMessage, HumanMessage, AIMessage, ToolMessage
 
 
-class ShoppingState(TypedDict):
+class ShoppingState(TypedDict, total=False):
     messages: Annotated[list, add_messages]
     conv_id: str
     stage: str
     product_context: str
     user_profile: str
     tool_rounds: int
-    supervisor_rounds: int        # outer loop counter for multi-agent supervisor
-    supervisor_decision: str      # "continue" | "finish"
-    next_worker: str              # routing target: "discovery"|"search"|"compare"|"profile"|"recommend"|"end"
-    error: str                    # error passthrough between agents
+    agent_rounds: int
+    stop_reason: str
 
 
 class ShoppingGuideGraph:
     """LangGraph state machine for shopping guide conversations.
 
-    Four-node graph:
+    Five-node graph:
       analyze  — load profile, classify stage, extract new profile signals
       retrieve — profile-augmented product search
-      agent    — LLM with tools (loops max 3 rounds via tools node)
+      agent    — LLM with tools
                   dynamically selects per-stage prompt to stay focused
       tools    — ToolNode executes tool calls
+      finalize — tool-free answer after a forced loop stop
 
-    Flow: analyze → retrieve → agent ⇄ tools → END
+    Flow: analyze → retrieve → agent ⇄ tools → END, or agent → finalize → END
     """
 
     def __init__(self, llm, tools: list, product_retriever, profile_store,
                  system_prompt: str, stage_classifier_prompt: str,
-                 max_tool_rounds: int = 3, stage_prompts: dict = None):
+                 max_tool_rounds: int = 3, stage_prompts: dict = None,
+                 checkpoint_db_path: str = None):
         self.llm = llm
         self.llm_with_tools = llm.bind_tools(tools)
         self.tools = tools
@@ -63,35 +69,28 @@ class ShoppingGuideGraph:
         self.stage_classifier_prompt = stage_classifier_prompt
         self.max_tool_rounds = max_tool_rounds
         self.stage_prompts = stage_prompts or {}
+        self.tool_node = ToolNode(self.tools, handle_tool_errors=True)
 
-        self.graph = self._build_graph(use_async=False)
-        self._stream_graph = None  # lazily built for streaming
+        self._checkpoint_conn = None
+        self.checkpointer = None
+        if checkpoint_db_path:
+            checkpoint_path = Path(checkpoint_db_path)
+            checkpoint_path.parent.mkdir(parents=True, exist_ok=True)
+            self._checkpoint_conn = sqlite3.connect(
+                str(checkpoint_path), check_same_thread=False
+            )
+            self.checkpointer = SqliteSaver(self._checkpoint_conn)
 
-        # Build streaming LLM for async nodes
-        try:
-            from langchain_openai import ChatOpenAI
-            if isinstance(llm, ChatOpenAI):
-                sllm = ChatOpenAI(
-                    model=llm.model_name,
-                    openai_api_key=llm.openai_api_key,
-                    openai_api_base=llm.openai_api_base,
-                    streaming=True,
-                    temperature=llm.temperature,
-                    request_timeout=llm.request_timeout,
-                )
-                self.llm_stream = sllm.bind_tools(tools)
-            else:
-                self.llm_stream = self.llm_with_tools
-        except Exception:
-            self.llm_stream = self.llm_with_tools
+        self.graph = self._build_graph()
 
-    def _build_graph(self, use_async: bool = False):
+    def _build_graph(self):
         workflow = StateGraph(ShoppingState)
 
         workflow.add_node("analyze", self._analyze_node)
         workflow.add_node("retrieve", self._retrieve_node)
-        workflow.add_node("agent", self._agent_node_async if use_async else self._agent_node)
-        workflow.add_node("tools", ToolNode(self.tools))
+        workflow.add_node("agent", self._agent_node)
+        workflow.add_node("tools", self._tools_node)
+        workflow.add_node("finalize", self._finalize_node)
 
         workflow.set_entry_point("analyze")
         workflow.add_edge("analyze", "retrieve")
@@ -99,16 +98,12 @@ class ShoppingGuideGraph:
         workflow.add_conditional_edges(
             "agent",
             self._route_after_agent,
-            {"tools": "tools", "end": END}
+            {"tools": "tools", "finalize": "finalize", "end": END}
         )
         workflow.add_edge("tools", "agent")
+        workflow.add_edge("finalize", END)
 
-        return workflow.compile()
-
-    def _get_stream_graph(self):
-        if self._stream_graph is None:
-            self._stream_graph = self._build_graph(use_async=True)
-        return self._stream_graph
+        return workflow.compile(checkpointer=self.checkpointer)
 
     # ---- Nodes ----
 
@@ -172,7 +167,7 @@ class ShoppingGuideGraph:
 
         return {"product_context": product_context}
 
-    def _invoke_with_retry(self, messages: list, max_retries: int = 3):
+    def _invoke_with_retry(self, messages: list, max_retries: int = 3, model=None):
         """Invoke LLM with exponential backoff on transient failures.
 
         Only retries on infrastructure errors (timeout, rate limit, connection
@@ -182,11 +177,12 @@ class ShoppingGuideGraph:
         """
         import time as _time
         from backend.logging_config import log, Timer
+        target_model = model or self.llm_with_tools
         last_exc = None
         for attempt in range(max_retries):
             try:
                 with Timer("llm_call", attempt=attempt + 1):
-                    result = self.llm_with_tools.invoke(messages)
+                    result = target_model.invoke(messages)
                 return result
             except Exception as e:
                 last_exc = e
@@ -205,7 +201,7 @@ class ShoppingGuideGraph:
         user_profile = state.get("user_profile", "(暂无画像)")
         product_context = state.get("product_context", "")
         conv_id = state.get("conv_id", "")
-        tool_rounds = state.get("tool_rounds", 0)
+        agent_rounds = state.get("agent_rounds", 0)
 
         # Select per-stage prompt, fall back to default system prompt
         prompt = self.stage_prompts.get(stage, self.system_prompt)
@@ -223,48 +219,92 @@ class ShoppingGuideGraph:
 
         return {
             "messages": [response],
-            "tool_rounds": tool_rounds + 1,
+            "agent_rounds": agent_rounds + 1,
+            "stop_reason": (
+                (state.get("stop_reason") or "completed")
+                if not response.tool_calls else ""
+            ),
         }
 
-    async def _agent_node_async(self, state: ShoppingState) -> dict:
-        """Async agent node using streaming LLM for token-level events."""
+    def _tools_node(self, state: ShoppingState) -> dict:
+        """Execute requested tools and count actual tool-node rounds."""
+        try:
+            result = self.tool_node.invoke(state)
+            tool_messages = result.get("messages", [])
+            has_error = any(
+                isinstance(message, ToolMessage)
+                and getattr(message, "status", "success") == "error"
+                for message in tool_messages
+            )
+            return {
+                "messages": tool_messages,
+                "tool_rounds": state.get("tool_rounds", 0) + 1,
+                "stop_reason": "tool_error" if has_error else "",
+            }
+        except Exception as exc:
+            last = state.get("messages", [])[-1] if state.get("messages") else None
+            tool_messages = []
+            for call in getattr(last, "tool_calls", []) or []:
+                tool_messages.append(ToolMessage(
+                    content="工具执行失败，请基于已有信息回答。",
+                    tool_call_id=call.get("id", "unknown"),
+                    status="error",
+                ))
+            return {
+                "messages": tool_messages,
+                "tool_rounds": state.get("tool_rounds", 0) + 1,
+                "stop_reason": "tool_error",
+            }
+
+    def _finalize_node(self, state: ShoppingState) -> dict:
+        """Produce a user-facing answer after a forced loop termination."""
         stage = state.get("stage", "discovery")
         user_profile = state.get("user_profile", "(暂无画像)")
         product_context = state.get("product_context", "")
         conv_id = state.get("conv_id", "")
-        tool_rounds = state.get("tool_rounds", 0)
-
         prompt = self.stage_prompts.get(stage, self.system_prompt)
         system_text = prompt.format(
-            conv_id=conv_id, stage=stage,
+            conv_id=conv_id,
+            stage=stage,
             user_profile=user_profile,
-            product_context=product_context or "(尚未搜索产品，请先挖掘用户需求)",
+            product_context=product_context or "(尚未搜索产品)",
         )
-
-        full_messages = [SystemMessage(content=system_text)] + list(state["messages"])
-
-        # Use astream so astream_events can capture on_chat_model_stream
-        response = None
-        async for chunk in self.llm_stream.astream(full_messages):
-            if response is None:
-                response = chunk
-            else:
-                response += chunk
-
+        conversation = list(state.get("messages", []))
+        skipped_tool_messages = []
+        last_message = conversation[-1] if conversation else None
+        for call in getattr(last_message, "tool_calls", []) or []:
+            skipped_tool_messages.append(ToolMessage(
+                content="工具调用因达到最大轮次而跳过。",
+                tool_call_id=call.get("id", "unknown"),
+                status="error",
+            ))
+        full_messages = [
+            SystemMessage(content=(
+                system_text
+                + "\n工具调用已停止。不得再调用任何工具，请严格基于现有对话、"
+                  "检索结果和工具返回生成一个非空的最终答复；信息不足时明确说明。"
+            )),
+            *conversation,
+            *skipped_tool_messages,
+        ]
+        response = self._invoke_with_retry(full_messages, model=self.llm)
+        if not getattr(response, "content", ""):
+            response = AIMessage(content="已达到工具调用上限，现有信息不足以形成可靠结论，请补充需求后重试。")
         return {
-            "messages": [response] if response else [],
-            "tool_rounds": tool_rounds + 1,
+            "messages": [*skipped_tool_messages, response],
+            "agent_rounds": state.get("agent_rounds", 0) + 1,
+            "stop_reason": state.get("stop_reason") or "max_tool_rounds",
         }
 
     # ---- Routing ----
 
-    def _route_after_agent(self, state: ShoppingState) -> Literal["tools", "end"]:
+    def _route_after_agent(self, state: ShoppingState) -> Literal["tools", "finalize", "end"]:
         """Route after agent node: continue to tools if LLM requested tool calls
         and we haven't hit the limit. Otherwise end the turn.
 
         The max_tool_rounds cap (default 3) prevents infinite agent-tool loops.
-        When exceeded, the graph ends even if tool_calls are pending — _agent_node
-        is responsible for producing a usable response before the limit.
+        When exceeded, pending tool calls are skipped and the graph routes to
+        a tool-free finalize node that must produce a user-facing response.
         """
         messages = state["messages"]
         tool_rounds = state.get("tool_rounds", 0)
@@ -272,7 +312,7 @@ class ShoppingGuideGraph:
         last_msg = messages[-1] if messages else None
         if last_msg and isinstance(last_msg, AIMessage) and last_msg.tool_calls:
             if tool_rounds >= self.max_tool_rounds:
-                return "end"
+                return "finalize"
             return "tools"
         return "end"
 
@@ -290,74 +330,143 @@ class ShoppingGuideGraph:
 
     async def run_stream(self, user_message: str, conv_id: str,
                          chat_history: list = None):
-        """Async generator: emits SSE events as the graph progresses.
-
-        Uses graph.astream() to yield after each node. Status events
-        indicate phase transitions; token events carry the final assistant
-        response progressively.
-        """
-        import asyncio
+        """Stream real model chunks plus graph lifecycle events as SSE."""
         import json as _json
-        import re
-
+        import time as _time
+        import uuid as _uuid
+        started_at = _time.perf_counter()
+        run_id = _uuid.uuid4().hex
+        config = {"configurable": {"thread_id": conv_id}}
+        has_checkpoint = bool(self.checkpointer and self.checkpointer.get_tuple(config))
         initial_state = {
-            "messages": (chat_history or []) + [HumanMessage(content=user_message)],
+            "messages": ([HumanMessage(content=user_message)] if has_checkpoint else
+                         (chat_history or []) + [HumanMessage(content=user_message)]),
             "conv_id": conv_id,
-            "stage": "discovery",
             "product_context": "",
             "user_profile": "",
             "tool_rounds": 0,
-            "supervisor_rounds": 0,
-            "supervisor_decision": "continue",
-            "next_worker": "discovery",
-            "error": "",
+            "agent_rounds": 0,
+            "stop_reason": "",
         }
+        if not has_checkpoint:
+            initial_state["stage"] = "discovery"
 
         def _emit(event_type, data):
             return f"event: {event_type}\ndata: {_json.dumps(data, ensure_ascii=False)}\n\n"
 
-        final_stage = "discovery"
-        final_tool_rounds = 0
-        seen_contents = set()
+        queue = asyncio.Queue()
+        loop = asyncio.get_running_loop()
+        cancelled = threading.Event()
 
+        def _push(item):
+            if not loop.is_closed():
+                loop.call_soon_threadsafe(queue.put_nowait, item)
+
+        def _worker():
+            stream = None
+            latest_state = dict(initial_state)
+            try:
+                stream = self.graph.stream(
+                    initial_state,
+                    config=config,
+                    stream_mode=["updates", "messages"],
+                )
+                for mode, payload in stream:
+                    if cancelled.is_set():
+                        break
+                    if mode == "updates":
+                        for node_output in payload.values():
+                            if node_output:
+                                latest_state.update({
+                                    key: value for key, value in node_output.items()
+                                    if key != "messages"
+                                })
+                    _push(("chunk", mode, payload))
+                if not cancelled.is_set():
+                    final_state = (
+                        dict(self.graph.get_state(config).values)
+                        if self.checkpointer else latest_state
+                    )
+                    _push(("done", final_state))
+            except Exception as exc:
+                from backend.logging_config import log
+                log("stream_worker_error", error=str(exc)[:200])
+                _push(("error", exc))
+            finally:
+                close = getattr(stream, "close", None)
+                if close:
+                    close()
+
+        worker_task = asyncio.create_task(asyncio.to_thread(_worker))
         try:
-            async for chunk in self.graph.astream(initial_state, stream_mode="updates"):
-                for node_name, node_output in chunk.items():
+            while True:
+                try:
+                    item = await asyncio.wait_for(queue.get(), timeout=60)
+                except asyncio.TimeoutError:
+                    yield _emit("error", {
+                        "run_id": run_id,
+                        "message": "Agent 响应超时，请稍后重试",
+                    })
+                    break
+                kind = item[0]
+                if kind == "error":
+                    yield _emit("error", {
+                        "run_id": run_id,
+                        "message": "Agent 执行失败，请稍后重试",
+                    })
+                    break
+                if kind == "done":
+                    result = item[1]
+                    yield _emit("done", {
+                        "run_id": run_id,
+                        "stage": result.get("stage", "discovery"),
+                        "tool_rounds": result.get("tool_rounds", 0),
+                        "agent_rounds": result.get("agent_rounds", 0),
+                        "stop_reason": result.get("stop_reason", "completed"),
+                        "user_profile": result.get("user_profile", ""),
+                        "product_context": result.get("product_context", ""),
+                        "latency_ms": round((_time.perf_counter() - started_at) * 1000),
+                    })
+                    break
+
+                _, mode, payload = item
+                if mode == "messages":
+                    message, metadata = payload
+                    if metadata.get("langgraph_node") not in {"agent", "finalize"}:
+                        continue
+                    content = getattr(message, "content", "")
+                    if isinstance(content, str) and content:
+                        yield _emit("token", {"content": content})
+                    continue
+
+                if mode != "updates":
+                    continue
+                for node_name, node_output in payload.items():
+                    node_output = node_output or {}
                     if node_name == "analyze":
-                        final_stage = node_output.get("stage", final_stage)
-                        yield _emit("stage", {"stage": final_stage})
-
-                    elif node_name == "retrieve":
-                        if node_output.get("product_context", ""):
-                            yield _emit("status", {"message": "已找到相关产品"})
-
-                    elif node_name == "tools":
-                        yield _emit("status", {"message": "正在分析结果..."})
-
+                        yield _emit("stage", {"stage": node_output.get("stage", "discovery")})
+                    elif node_name == "retrieve" and node_output.get("product_context"):
+                        yield _emit("status", {"message": "已找到相关产品"})
                     elif node_name == "agent":
-                        final_tool_rounds = node_output.get("tool_rounds", final_tool_rounds)
-                        for m in node_output.get("messages", []):
-                            if not isinstance(m, AIMessage) or not m.content:
-                                continue
-                            if m.tool_calls:
-                                names = [tc.get("name", "") for tc in m.tool_calls]
-                                yield _emit("status", {"message": f"正在调用: {', '.join(names)}"})
-                            elif m.content not in seen_contents:
-                                seen_contents.add(m.content)
-                                for chunk_text in re.split(r'(?<=[。！？\n])', m.content):
-                                    if chunk_text.strip():
-                                        yield _emit("token", {"content": chunk_text})
-                                        await asyncio.sleep(0.01)
-
-            yield _emit("done", {
-                "stage": final_stage,
-                "tool_rounds": final_tool_rounds,
-            })
-
-        except asyncio.TimeoutError:
-            yield _emit("error", {"message": "请求超时，请稍后重试"})
-        except Exception as exc:
-            yield _emit("error", {"message": str(exc)})
+                        for message in node_output.get("messages", []):
+                            calls = getattr(message, "tool_calls", []) or []
+                            if calls:
+                                yield _emit("tool_start", {
+                                    "tools": [call.get("name", "") for call in calls],
+                                })
+                    elif node_name == "tools":
+                        tool_messages = [
+                            message for message in node_output.get("messages", [])
+                            if isinstance(message, ToolMessage)
+                        ]
+                        yield _emit("tool_end", {
+                            "tools": [getattr(message, "name", "") or "tool" for message in tool_messages],
+                            "statuses": [getattr(message, "status", "success") for message in tool_messages],
+                        })
+        finally:
+            cancelled.set()
+            if not worker_task.done():
+                worker_task.cancel()
 
     def run(self, user_message: str, conv_id: str,
             chat_history: list = None) -> dict:
@@ -371,16 +480,22 @@ class ShoppingGuideGraph:
         Returns:
             dict with keys: messages, stage, product_context, user_profile, tool_rounds
         """
+        config = {"configurable": {"thread_id": conv_id}}
+        has_checkpoint = bool(self.checkpointer and self.checkpointer.get_tuple(config))
         initial_state = {
-            "messages": (chat_history or []) + [HumanMessage(content=user_message)],
+            "messages": ([HumanMessage(content=user_message)] if has_checkpoint else
+                         (chat_history or []) + [HumanMessage(content=user_message)]),
             "conv_id": conv_id,
-            "stage": "discovery",
             "product_context": "",
             "user_profile": "",
             "tool_rounds": 0,
+            "agent_rounds": 0,
+            "stop_reason": "",
         }
+        if not has_checkpoint:
+            initial_state["stage"] = "discovery"
 
-        result = self.graph.invoke(initial_state)
+        result = self.graph.invoke(initial_state, config=config)
 
         return {
             "messages": result["messages"],
@@ -388,7 +503,19 @@ class ShoppingGuideGraph:
             "product_context": result.get("product_context", ""),
             "user_profile": result.get("user_profile", ""),
             "tool_rounds": result.get("tool_rounds", 0),
+            "agent_rounds": result.get("agent_rounds", 0),
+            "stop_reason": result.get("stop_reason", "completed"),
         }
+
+    def clear_thread(self, conv_id: str) -> None:
+        """Delete persisted graph state for one conversation."""
+        if self.checkpointer:
+            self.checkpointer.delete_thread(conv_id)
+
+    def close(self) -> None:
+        if self._checkpoint_conn is not None:
+            self._checkpoint_conn.close()
+            self._checkpoint_conn = None
 
 
 # ---- Standalone helpers (usable by both old and new architecture) ----
@@ -460,7 +587,7 @@ def extract_profile_signals(conv_id: str, user_message: str, profile_store) -> N
 
     Extracts: budget, product_category, primary_use, mobility,
     preferred_brand, exclude_brand. Callable from both
-    ShoppingGuideGraph and SupervisorGraph.
+    ShoppingGuideGraph and standalone callers.
     """
     import re
     msg = user_message

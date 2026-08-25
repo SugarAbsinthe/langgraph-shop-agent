@@ -30,6 +30,8 @@ class ChatResponse(BaseModel):
     product_context: str
     user_profile: str
     tool_rounds: int
+    agent_rounds: int
+    stop_reason: str
 
 
 # ---- Conversations ----

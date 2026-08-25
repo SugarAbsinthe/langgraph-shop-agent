@@ -44,7 +44,9 @@ export interface StreamCallbacks {
   onToken: (content: string) => void;
   onStatus: (message: string) => void;
   onStage: (stage: string) => void;
-  onDone: (meta: { stage: string; tool_rounds: number; product_context?: string; user_profile?: string }) => void;
+  onToolStart?: (tools: string[]) => void;
+  onToolEnd?: (tools: string[], statuses: string[]) => void;
+  onDone: (meta: import("../types").StreamDoneMeta) => void;
   onError: (message: string) => void;
 }
 
@@ -76,6 +78,7 @@ export async function sendMessageStream(
 
   const decoder = new TextDecoder();
   let buffer = "";
+  let eventType = "";
 
   while (true) {
     const { done, value } = await reader.read();
@@ -85,7 +88,6 @@ export async function sendMessageStream(
     const lines = buffer.split("\n");
     buffer = lines.pop() || "";
 
-    let eventType = "";
     for (const line of lines) {
       if (line.startsWith("event: ")) {
         eventType = line.slice(7).trim();
@@ -101,6 +103,12 @@ export async function sendMessageStream(
           case "stage":
             callbacks.onStage(data.stage);
             break;
+          case "tool_start":
+            callbacks.onToolStart?.(data.tools || []);
+            break;
+          case "tool_end":
+            callbacks.onToolEnd?.(data.tools || [], data.statuses || []);
+            break;
           case "done":
             callbacks.onDone(data);
             break;
@@ -108,6 +116,7 @@ export async function sendMessageStream(
             callbacks.onError(data.message);
             break;
         }
+        eventType = "";
       }
     }
   }

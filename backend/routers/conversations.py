@@ -4,7 +4,7 @@ import logging
 
 from fastapi import APIRouter, HTTPException
 
-from backend.dependencies import get_conv_store
+from backend.dependencies import get_conv_store, clear_conversation_runtime
 from backend.schemas import (
     ConversationItem,
     CreateConversationRequest,
@@ -46,6 +46,7 @@ async def delete_conversation(conv_id: str):
     if not conv:
         raise HTTPException(status_code=404, detail="Conversation not found")
     store.delete_conversation(conv_id)
+    clear_conversation_runtime(conv_id)
     return {"deleted": conv_id}
 
 
@@ -80,10 +81,11 @@ async def add_message(conv_id: str, body: AddMessageRequest):
 
 @router.delete("/conversations/{conv_id}/messages")
 async def clear_messages(conv_id: str):
-    """Clear all messages in a conversation (keep the conversation record)."""
+    """Clear messages and Agent runtime state, keeping the conversation record."""
     store = get_conv_store()
     conv = store.get_conversation(conv_id)
     if not conv:
         raise HTTPException(status_code=404, detail="Conversation not found")
     store.clear_messages(conv_id)
+    clear_conversation_runtime(conv_id)
     return {"cleared": conv_id}

@@ -7,7 +7,7 @@ import json as _json
 
 from fastapi import APIRouter, HTTPException
 from fastapi.responses import StreamingResponse
-from langchain.schema import HumanMessage, AIMessage
+from langchain_core.messages import HumanMessage, AIMessage
 
 from backend.dependencies import get_agent
 from backend.schemas import ChatRequest, ChatResponse
@@ -65,7 +65,7 @@ async def chat(request: ChatRequest):
         raise HTTPException(status_code=504, detail="Agent response timed out, please try again")
     except Exception as e:
         log("request_error", error=str(e)[:200])
-        raise HTTPException(status_code=500, detail=f"Agent execution failed: {e}")
+        raise HTTPException(status_code=500, detail="Agent execution failed")
 
     return ChatResponse(
         answer=result.get("answer", ""),
@@ -73,6 +73,8 @@ async def chat(request: ChatRequest):
         product_context=result.get("product_context", ""),
         user_profile=result.get("user_profile", ""),
         tool_rounds=result.get("tool_rounds", 0),
+        agent_rounds=result.get("agent_rounds", 0),
+        stop_reason=result.get("stop_reason", "completed"),
     )
 
 
@@ -97,7 +99,7 @@ async def chat_stream(request: ChatRequest):
             log("stream_end")
         except Exception as exc:
             log("stream_error", error=str(exc)[:200])
-            yield _format_sse("error", {"message": str(exc)})
+            yield _format_sse("error", {"message": "Agent execution failed"})
 
     return StreamingResponse(
         _event_generator(),

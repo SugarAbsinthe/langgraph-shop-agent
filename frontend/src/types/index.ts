@@ -17,6 +17,19 @@ export interface ChatResponse {
   product_context: string;
   user_profile: string;
   tool_rounds: number;
+  agent_rounds: number;
+  stop_reason: string;
+}
+
+export interface StreamDoneMeta {
+  run_id: string;
+  stage: string;
+  tool_rounds: number;
+  agent_rounds: number;
+  stop_reason: string;
+  product_context: string;
+  user_profile: string;
+  latency_ms: number;
 }
 
 /* ---- Conversations ---- */

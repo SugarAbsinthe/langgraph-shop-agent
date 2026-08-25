@@ -89,6 +89,55 @@ def get_conv_store():
     return _conv_store
 
 
+def clear_conversation_runtime(conv_id: str) -> None:
+    """Clear graph checkpoints and profile data without forcing Agent startup."""
+    if _agent is not None:
+        try:
+            _agent.clear_conversation_state(conv_id)
+        except Exception as exc:
+            logger.error("Failed to clear runtime state for %s: %s", conv_id, exc)
+        return
+
+    from src.config import config
+
+    # Structured profile data can be removed directly without loading the
+    # embedding model. Semantic memory is best-effort because Chroma is optional.
+    import os
+    import sqlite3
+    if os.path.exists(config.PROFILE_DB_PATH):
+        conn = sqlite3.connect(config.PROFILE_DB_PATH)
+        try:
+            conn.execute("DELETE FROM user_profiles WHERE conv_id = ?", (conv_id,))
+            conn.commit()
+        except sqlite3.OperationalError:
+            pass
+        finally:
+            conn.close()
+
+    if os.path.exists(config.AGENT_CHECKPOINT_DB_PATH):
+        from langgraph.checkpoint.sqlite import SqliteSaver
+        try:
+            with SqliteSaver.from_conn_string(config.AGENT_CHECKPOINT_DB_PATH) as saver:
+                saver.delete_thread(conv_id)
+        except sqlite3.OperationalError:
+            pass
+
+    try:
+        import chromadb
+        client = chromadb.PersistentClient(path=config.PROFILE_CHROMA_DIR)
+        client.get_collection("user_memory").delete(where={"conv_id": conv_id})
+    except Exception:
+        pass
+
+
+def close_dependencies() -> None:
+    """Release process-wide resources during application shutdown."""
+    global _agent
+    if _agent is not None:
+        _agent.close()
+        _agent = None
+
+
 def get_component_status() -> dict:
     """Check health of all backend components."""
     status = {"llm": False, "chromadb": False, "redis": False, "database": False}

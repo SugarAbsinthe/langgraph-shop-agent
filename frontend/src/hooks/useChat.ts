@@ -48,6 +48,7 @@ type Action =
   | { type: "SET_MESSAGES"; payload: DisplayMessage[] }
   | { type: "ADD_MESSAGE"; payload: DisplayMessage }
   | { type: "APPEND_TOKEN"; payload: string }
+  | { type: "REMOVE_EMPTY_ASSISTANT" }
   | { type: "UPDATE_LAST_DETAILS"; payload: Record<string, unknown> }
   | { type: "SET_LOADING"; payload: boolean }
   | { type: "SET_RESPONSE"; payload: { stage: string; user_profile: string; product_context: string; tool_rounds: number } }
@@ -73,6 +74,13 @@ function reducer(state: AppState, action: Action): AppState {
         msgs[msgs.length - 1] = { ...last, content: last.content + action.payload };
       }
       return { ...state, messages: msgs };
+    }
+    case "REMOVE_EMPTY_ASSISTANT": {
+      const last = state.messages[state.messages.length - 1];
+      if (last?.role === "assistant" && !last.content) {
+        return { ...state, messages: state.messages.slice(0, -1) };
+      }
+      return state;
     }
     case "UPDATE_LAST_DETAILS": {
       const msgs = [...state.messages];
@@ -198,10 +206,29 @@ export function useChat() {
         onStage(stage) {
           dispatch({ type: "UPDATE_LAST_DETAILS", payload: { stage } });
         },
+        onToolStart(tools) {
+          dispatch({ type: "SET_STATUS", payload: `正在调用：${tools.join(", ")}` });
+        },
+        onToolEnd(_tools, statuses) {
+          const failed = statuses.some((status) => status === "error");
+          dispatch({
+            type: "SET_STATUS",
+            payload: failed ? "部分工具执行失败，正在整理已有结果" : "工具执行完成，正在整理结果",
+          });
+        },
         onDone(meta) {
-          api.saveMessage(convId, "assistant", answerText, {
-            stage: meta.stage, tool_rounds: meta.tool_rounds,
-          }).catch(() => {});
+          if (answerText) {
+            api.saveMessage(convId, "assistant", answerText, {
+              run_id: meta.run_id,
+              stage: meta.stage,
+              tool_rounds: meta.tool_rounds,
+              agent_rounds: meta.agent_rounds,
+              stop_reason: meta.stop_reason,
+              latency_ms: meta.latency_ms,
+            }).catch(() => {});
+          } else {
+            dispatch({ type: "REMOVE_EMPTY_ASSISTANT" });
+          }
           dispatch({
             type: "UPDATE_LAST_DETAILS",
             payload: { stage: meta.stage, tool_rounds: meta.tool_rounds },
@@ -217,6 +244,9 @@ export function useChat() {
           });
         },
         onError(message) {
+          if (answerText === "") {
+            dispatch({ type: "REMOVE_EMPTY_ASSISTANT" });
+          }
           dispatch({ type: "SET_ERROR", payload: message });
         },
       }, controller.signal);
@@ -225,7 +255,12 @@ export function useChat() {
       const convs = await api.listConversations();
       dispatch({ type: "SET_CONVERSATIONS", payload: convs });
     } catch (e: any) {
-      dispatch({ type: "SET_ERROR", payload: e.message });
+      if (answerText === "") {
+        dispatch({ type: "REMOVE_EMPTY_ASSISTANT" });
+      }
+      if (e?.name !== "AbortError") {
+        dispatch({ type: "SET_ERROR", payload: e.message });
+      }
     } finally {
       dispatch({ type: "SET_LOADING", payload: false });
     }

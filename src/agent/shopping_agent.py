@@ -1,14 +1,13 @@
 """Shopping Guide Agent — wraps LLM + tools + retrievers + profile store.
 
-Four-node LangGraph pipeline (analyze → retrieve → agent ⇄ tools) with
-per-stage prompt injection to keep each phase focused without the overhead
-of multi-agent orchestration.
+LangGraph pipeline (analyze → retrieve → agent ⇄ tools → finalize) with
+per-stage prompt injection, durable conversation state, and bounded tool loops.
 """
 
 from typing import Optional
 from pathlib import Path
 
-from langchain.schema import HumanMessage, AIMessage
+from langchain_core.messages import HumanMessage, AIMessage
 
 from src.agent.langgraph_engine import ShoppingGuideGraph
 from src.agent.shopping_tools import (
@@ -45,6 +44,7 @@ class ShoppingGuideAgent:
         reviews_db: Optional[str] = None,
         system_prompt: str = SHOPPING_SYSTEM_PROMPT,
         max_tool_rounds: int = 3,
+        checkpoint_db_path: Optional[str] = None,
     ):
         self.llm = llm
         self.product_retriever = product_retriever
@@ -85,6 +85,7 @@ class ShoppingGuideAgent:
             stage_classifier_prompt=STAGE_CLASSIFIER_PROMPT,
             max_tool_rounds=max_tool_rounds,
             stage_prompts=stage_prompts,
+            checkpoint_db_path=checkpoint_db_path or config.AGENT_CHECKPOINT_DB_PATH,
         )
 
     def run(self, question: str, conv_id: str = "default",
@@ -120,6 +121,8 @@ class ShoppingGuideAgent:
             "user_profile": result["user_profile"],
             "messages": result["messages"],
             "tool_rounds": result["tool_rounds"],
+            "agent_rounds": result["agent_rounds"],
+            "stop_reason": result["stop_reason"],
         }
 
     async def run_stream(self, question: str, conv_id: str = "default",
@@ -130,13 +133,29 @@ class ShoppingGuideAgent:
         ):
             yield event
 
+    def clear_conversation_state(self, conv_id: str) -> None:
+        errors = []
+        try:
+            self.graph.clear_thread(conv_id)
+        except Exception as exc:
+            errors.append(exc)
+        try:
+            self.profile_store.clear_conv(conv_id)
+        except Exception as exc:
+            errors.append(exc)
+        if errors:
+            raise RuntimeError("Failed to clear all conversation runtime state") from errors[0]
+
+    def close(self) -> None:
+        self.graph.close()
+
     def run_simple(self, question: str, conv_id: str = "default") -> dict:
         """Simplified single-shot mode: no LangGraph, one LLM call with tools.
 
         Useful for quick testing or when LangGraph is unavailable.
         """
-        from langchain.prompts import ChatPromptTemplate
-        from langchain.schema.output_parser import StrOutputParser
+        from langchain_core.prompts import ChatPromptTemplate
+        from langchain_core.output_parsers import StrOutputParser
 
         user_profile = self.profile_store.serialize_profile(conv_id)
 
