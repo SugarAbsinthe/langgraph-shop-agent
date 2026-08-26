@@ -19,6 +19,20 @@ export interface ChatResponse {
   tool_rounds: number;
   agent_rounds: number;
   stop_reason: string;
+  run_id: string;
+  request_id: string;
+  latency_ms: number;
+  llm_calls: number;
+  llm_latency_ms: number;
+  llm_retries: number;
+  input_tokens: number | null;
+  output_tokens: number | null;
+  total_tokens: number | null;
+  retrieval_triggered: boolean;
+  cache_hit: boolean | null;
+  requested_tools: string[];
+  executed_tools: string[];
+  tool_errors: number;
 }
 
 export interface StreamDoneMeta {
@@ -30,6 +44,18 @@ export interface StreamDoneMeta {
   product_context: string;
   user_profile: string;
   latency_ms: number;
+  request_id: string;
+  llm_calls: number;
+  llm_latency_ms: number;
+  llm_retries: number;
+  input_tokens: number | null;
+  output_tokens: number | null;
+  total_tokens: number | null;
+  retrieval_triggered: boolean;
+  cache_hit: boolean | null;
+  requested_tools: string[];
+  executed_tools: string[];
+  tool_errors: number;
 }
 
 /* ---- Conversations ---- */

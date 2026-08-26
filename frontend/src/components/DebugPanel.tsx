@@ -94,7 +94,6 @@ export default function DebugPanel({
         {activeTab === "tools" && (
           <div className="text-xs text-slate-500 space-y-1">
             <p>🔄 本轮工具调用 <strong>{toolRounds}</strong> 轮</p>
-            <p className="text-slate-400">完整调用链 → LangSmith Trace</p>
           </div>
         )}
       </div>

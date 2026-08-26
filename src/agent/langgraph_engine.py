@@ -30,6 +30,19 @@ from langgraph.prebuilt import ToolNode
 from langgraph.checkpoint.sqlite import SqliteSaver
 from langchain_core.messages import SystemMessage, HumanMessage, AIMessage, ToolMessage
 
+from backend.logging_config import (
+    Timer,
+    create_run_telemetry,
+    hash_identifier,
+    log,
+    mark_retrieval,
+    record_executed_tools,
+    record_llm_response,
+    record_llm_retry,
+    record_requested_tools,
+    run_context,
+)
+
 
 class ShoppingState(TypedDict, total=False):
     messages: Annotated[list, add_messages]
@@ -155,6 +168,8 @@ class ShoppingGuideGraph:
         if not last_user_msg:
             return {"product_context": ""}
 
+        mark_retrieval()
+
         # Augment query with profile context
         augmented_query = last_user_msg
         if user_profile and user_profile != "(暂无画像)":
@@ -176,13 +191,13 @@ class ShoppingGuideGraph:
         Delay: 1s → 2s → 4s (3 attempts max).
         """
         import time as _time
-        from backend.logging_config import log, Timer
         target_model = model or self.llm_with_tools
         last_exc = None
         for attempt in range(max_retries):
             try:
                 with Timer("llm_call", attempt=attempt + 1):
                     result = target_model.invoke(messages)
+                record_llm_response(result)
                 return result
             except Exception as e:
                 last_exc = e
@@ -191,9 +206,10 @@ class ShoppingGuideGraph:
                     raise
                 if attempt < max_retries - 1:
                     delay = 2 ** attempt  # 1s, 2s, 4s
+                    record_llm_retry()
                     log("llm_retry", attempt=attempt + 2, delay=delay)
                     _time.sleep(delay)
-        log("llm_fail", attempts=max_retries, error=str(last_exc)[:100])
+        log("llm_fail", attempts=max_retries, error_type=type(last_exc).__name__)
         raise last_exc
 
     def _agent_node(self, state: ShoppingState) -> dict:
@@ -216,6 +232,9 @@ class ShoppingGuideGraph:
         full_messages = [SystemMessage(content=system_text)] + list(state["messages"])
 
         response = self._invoke_with_retry(full_messages)
+        record_requested_tools(
+            call.get("name", "") for call in (response.tool_calls or [])
+        )
 
         return {
             "messages": [response],
@@ -236,6 +255,10 @@ class ShoppingGuideGraph:
                 and getattr(message, "status", "success") == "error"
                 for message in tool_messages
             )
+            record_executed_tools(
+                [getattr(message, "name", "") or "tool" for message in tool_messages],
+                [getattr(message, "status", "success") for message in tool_messages],
+            )
             return {
                 "messages": tool_messages,
                 "tool_rounds": state.get("tool_rounds", 0) + 1,
@@ -250,6 +273,10 @@ class ShoppingGuideGraph:
                     tool_call_id=call.get("id", "unknown"),
                     status="error",
                 ))
+            record_executed_tools(
+                [call.get("name", "") or "tool" for call in getattr(last, "tool_calls", []) or []],
+                ["error"] * len(tool_messages),
+            )
             return {
                 "messages": tool_messages,
                 "tool_rounds": state.get("tool_rounds", 0) + 1,
@@ -328,15 +355,27 @@ class ShoppingGuideGraph:
 
     # ---- Public API ----
 
+    @staticmethod
+    def _run_config(conv_id: str, telemetry) -> dict:
+        """Build trace metadata without exposing the raw conversation id."""
+        conv_hash = hash_identifier(conv_id)
+        return {
+            "configurable": {"thread_id": conv_id},
+            "tags": ["shopping-agent"],
+            "metadata": {
+                "run_id": telemetry.run_id,
+                "request_id": telemetry.request_id,
+                "conversation_hash": conv_hash,
+            },
+        }
+
     async def run_stream(self, user_message: str, conv_id: str,
                          chat_history: list = None):
         """Stream real model chunks plus graph lifecycle events as SSE."""
         import json as _json
-        import time as _time
-        import uuid as _uuid
-        started_at = _time.perf_counter()
-        run_id = _uuid.uuid4().hex
-        config = {"configurable": {"thread_id": conv_id}}
+        telemetry = create_run_telemetry()
+        run_id = telemetry.run_id
+        config = self._run_config(conv_id, telemetry)
         has_checkpoint = bool(self.checkpointer and self.checkpointer.get_tuple(config))
         initial_state = {
             "messages": ([HumanMessage(content=user_message)] if has_checkpoint else
@@ -366,31 +405,39 @@ class ShoppingGuideGraph:
             stream = None
             latest_state = dict(initial_state)
             try:
-                stream = self.graph.stream(
-                    initial_state,
-                    config=config,
-                    stream_mode=["updates", "messages"],
-                )
-                for mode, payload in stream:
-                    if cancelled.is_set():
-                        break
-                    if mode == "updates":
-                        for node_output in payload.values():
-                            if node_output:
-                                latest_state.update({
-                                    key: value for key, value in node_output.items()
-                                    if key != "messages"
-                                })
-                    _push(("chunk", mode, payload))
-                if not cancelled.is_set():
-                    final_state = (
-                        dict(self.graph.get_state(config).values)
-                        if self.checkpointer else latest_state
+                with run_context(telemetry):
+                    stream = self.graph.stream(
+                        initial_state,
+                        config=config,
+                        stream_mode=["updates", "messages"],
                     )
-                    _push(("done", final_state))
+                    for mode, payload in stream:
+                        if cancelled.is_set():
+                            break
+                        if mode == "updates":
+                            for node_output in payload.values():
+                                if node_output:
+                                    latest_state.update({
+                                        key: value for key, value in node_output.items()
+                                        if key != "messages"
+                                    })
+                        _push(("chunk", mode, payload))
+                    if not cancelled.is_set():
+                        final_state = (
+                            dict(self.graph.get_state(config).values)
+                            if self.checkpointer else latest_state
+                        )
+                        log(
+                            "run_end",
+                            stage=final_state.get("stage", "discovery"),
+                            tool_rounds=final_state.get("tool_rounds", 0),
+                            stop_reason=final_state.get("stop_reason", "completed"),
+                            **telemetry.snapshot(),
+                        )
+                        _push(("done", final_state))
             except Exception as exc:
-                from backend.logging_config import log
-                log("stream_worker_error", error=str(exc)[:200])
+                with run_context(telemetry):
+                    log("stream_worker_error", error_type=type(exc).__name__)
                 _push(("error", exc))
             finally:
                 close = getattr(stream, "close", None)
@@ -418,14 +465,13 @@ class ShoppingGuideGraph:
                 if kind == "done":
                     result = item[1]
                     yield _emit("done", {
-                        "run_id": run_id,
                         "stage": result.get("stage", "discovery"),
                         "tool_rounds": result.get("tool_rounds", 0),
                         "agent_rounds": result.get("agent_rounds", 0),
                         "stop_reason": result.get("stop_reason", "completed"),
                         "user_profile": result.get("user_profile", ""),
                         "product_context": result.get("product_context", ""),
-                        "latency_ms": round((_time.perf_counter() - started_at) * 1000),
+                        **telemetry.snapshot(),
                     })
                     break
 
@@ -480,7 +526,8 @@ class ShoppingGuideGraph:
         Returns:
             dict with keys: messages, stage, product_context, user_profile, tool_rounds
         """
-        config = {"configurable": {"thread_id": conv_id}}
+        telemetry = create_run_telemetry()
+        config = self._run_config(conv_id, telemetry)
         has_checkpoint = bool(self.checkpointer and self.checkpointer.get_tuple(config))
         initial_state = {
             "messages": ([HumanMessage(content=user_message)] if has_checkpoint else
@@ -495,7 +542,19 @@ class ShoppingGuideGraph:
         if not has_checkpoint:
             initial_state["stage"] = "discovery"
 
-        result = self.graph.invoke(initial_state, config=config)
+        with run_context(telemetry):
+            try:
+                result = self.graph.invoke(initial_state, config=config)
+            except Exception as exc:
+                log("run_error", error_type=type(exc).__name__)
+                raise
+            log(
+                "run_end",
+                stage=result.get("stage", "discovery"),
+                tool_rounds=result.get("tool_rounds", 0),
+                stop_reason=result.get("stop_reason", "completed"),
+                **telemetry.snapshot(),
+            )
 
         return {
             "messages": result["messages"],
@@ -505,6 +564,7 @@ class ShoppingGuideGraph:
             "tool_rounds": result.get("tool_rounds", 0),
             "agent_rounds": result.get("agent_rounds", 0),
             "stop_reason": result.get("stop_reason", "completed"),
+            **telemetry.snapshot(),
         }
 
     def clear_thread(self, conv_id: str) -> None:

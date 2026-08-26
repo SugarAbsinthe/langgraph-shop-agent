@@ -1,11 +1,13 @@
 """Regression tests for chat metadata and conversation cleanup contracts."""
 
 import asyncio
+import json
 
 import pytest
 from fastapi import HTTPException
 
 from backend.schemas import ChatRequest
+from backend.logging_config import get_request_id, reset_request_id, set_request_id
 from backend.routers import chat as chat_router
 from backend.routers import conversations as conversation_router
 
@@ -25,16 +27,39 @@ class FakeAgent:
             "tool_rounds": 1,
             "agent_rounds": 2,
             "stop_reason": "completed",
+            "run_id": "run-test",
+            "request_id": get_request_id(),
+            "latency_ms": 25,
+            "llm_calls": 2,
+            "llm_latency_ms": 20,
+            "llm_retries": 0,
+            "input_tokens": 12,
+            "output_tokens": 8,
+            "total_tokens": 20,
+            "retrieval_triggered": True,
+            "cache_hit": False,
+            "requested_tools": ["search_products"],
+            "executed_tools": ["search_products"],
+            "tool_errors": 0,
         }
 
 
 def test_chat_response_includes_execution_metadata(monkeypatch):
     monkeypatch.setattr(chat_router, "get_agent", lambda: FakeAgent())
-    response = asyncio.run(chat_router.chat(ChatRequest(
-        conv_id="conv-1", question="hello", chat_history=[]
-    )))
+    token = set_request_id("request-test")
+    try:
+        response = asyncio.run(chat_router.chat(ChatRequest(
+            conv_id="conv-1", question="hello", chat_history=[]
+        )))
+    finally:
+        reset_request_id(token)
     assert response.agent_rounds == 2
     assert response.stop_reason == "completed"
+    assert response.run_id == "run-test"
+    assert response.request_id == "request-test"
+    assert response.llm_calls == 2
+    assert response.total_tokens == 20
+    assert response.executed_tools == ["search_products"]
 
 
 def test_chat_error_does_not_expose_internal_exception(monkeypatch):
@@ -47,6 +72,29 @@ def test_chat_error_does_not_expose_internal_exception(monkeypatch):
         )))
     assert exc_info.value.detail == "Agent execution failed"
     assert "secret" not in exc_info.value.detail
+
+
+def test_stream_keeps_request_context_after_response_creation(monkeypatch):
+    class FakeStreamAgent:
+        async def run_stream(self, **kwargs):
+            payload = json.dumps({"request_id": get_request_id()})
+            yield f"event: done\ndata: {payload}\n\n"
+
+    monkeypatch.setattr(chat_router, "get_agent", lambda: FakeStreamAgent())
+
+    async def execute():
+        token = set_request_id("stream-request")
+        response = await chat_router.chat_stream(ChatRequest(
+            conv_id="conv-stream", question="hello", chat_history=[]
+        ))
+        reset_request_id(token)
+        chunks = [chunk async for chunk in response.body_iterator]
+        return "".join(chunks)
+
+    body = asyncio.run(execute())
+    payload = json.loads(body.split("data: ", 1)[1])
+    assert payload["request_id"] == "stream-request"
+    assert get_request_id() == ""
 
 
 def test_delete_conversation_clears_runtime_state(monkeypatch):

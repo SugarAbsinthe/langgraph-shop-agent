@@ -19,8 +19,10 @@ BASE_DIR = Path(__file__).resolve().parent.parent.parent
 if str(BASE_DIR) not in sys.path:
     sys.path.insert(0, str(BASE_DIR))
 
-from src.config import config
+from src.config import config, init_langsmith
 from src.db.conversation_store import ConversationStore
+
+init_langsmith()
 
 # ---- Model presets ----
 MODEL_PRESETS = {
@@ -71,22 +73,6 @@ STAGE_EMOJI = {
 }
 
 CONV_STORE = ConversationStore(str(BASE_DIR / "data" / "conversations.db"))
-
-
-def _get_langsmith_trace_url():
-    if os.environ.get("LANGSMITH_TRACING", "").lower() != "true":
-        return None
-    if not os.environ.get("LANGSMITH_API_KEY"):
-        return None
-    try:
-        from langsmith import Client
-        project = os.environ.get("LANGSMITH_PROJECT", "shopping-guide-agent")
-        runs = list(Client().list_runs(project_name=project, limit=1))
-        if runs:
-            return f"https://smith.langchain.com/traces/{runs[0].trace_id}"
-    except Exception:
-        pass
-    return None
 
 
 # ---- Page config ----
@@ -425,9 +411,12 @@ if question := st.chat_input("说说你的需求..."):
 
             # Debug expander
             with st.expander("🔍 调试详情: 阶段 → 画像 → 检索 → 工具调用"):
-                trace_url = _get_langsmith_trace_url()
-                if trace_url:
-                    st.markdown(f"[查看完整 Trace →]({trace_url})")
+                run_id = result.get("run_id", "")
+                if run_id:
+                    st.caption(
+                        f"Run {run_id[:12]} · {result.get('latency_ms', 0)} ms · "
+                        f"LLM {result.get('llm_calls', 0)} 次"
+                    )
 
                 col_a, col_b, col_c = st.columns(3)
                 with col_a:

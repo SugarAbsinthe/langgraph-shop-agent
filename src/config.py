@@ -1,5 +1,6 @@
 """Centralized configuration management for shopping guide Agent."""
 import os
+import logging
 from pathlib import Path
 from typing import Any
 
@@ -43,8 +44,9 @@ class Config:
     PROFILE_DECAY_LAMBDA: float = 0.05  # half-life ~14 days
 
     # LangSmith
-    LANGSMITH_TRACING: bool = os.getenv("LANGSMITH_TRACING", "true").lower() == "true"
-    LANGSMITH_PROJECT: str = os.getenv("LANGSMITH_PROJECT", "shopping-guide-agent")
+    LANGSMITH_TRACING: bool = os.getenv("LANGSMITH_TRACING", "false").lower() == "true"
+    LANGSMITH_API_KEY: str = os.getenv("LANGSMITH_API_KEY", "")
+    LANGSMITH_PROJECT: str = os.getenv("LANGSMITH_PROJECT", "langgraph-shop-agent")
     LANGSMITH_ENDPOINT: str = os.getenv("LANGSMITH_ENDPOINT", "https://api.smith.langchain.com")
 
 
@@ -126,18 +128,26 @@ def create_llm(api_key: str = None, base_url: str = None, model: str = None,
     return llm
 
 
-def init_langsmith() -> None:
-    """Enable LangSmith tracing if configured.
+def init_langsmith(environ=None) -> bool:
+    """Enable optional tracing only when explicitly configured with a key."""
+    target_env = os.environ if environ is None else environ
+    if not config.LANGSMITH_TRACING:
+        target_env["LANGSMITH_TRACING"] = "false"
+        return False
 
-    Must be called before any LangChain agent/chain invocation.
-    Called automatically by app.py and evaluate.py entry points.
-    """
-    if config.LANGSMITH_TRACING:
-        os.environ.setdefault("LANGSMITH_TRACING", "true")
-        os.environ.setdefault("LANGSMITH_PROJECT", config.LANGSMITH_PROJECT)
-        os.environ.setdefault("LANGSMITH_ENDPOINT", config.LANGSMITH_ENDPOINT)
-        if config.OPENAI_API_KEY and not os.environ.get("LANGSMITH_API_KEY"):
-            pass  # LangSmith API key is optional for tracing-only mode
+    api_key = config.LANGSMITH_API_KEY or target_env.get("LANGSMITH_API_KEY", "")
+    if not api_key:
+        target_env["LANGSMITH_TRACING"] = "false"
+        logging.getLogger(__name__).warning(
+            "LangSmith tracing requested but LANGSMITH_API_KEY is missing; tracing disabled"
+        )
+        return False
+
+    target_env["LANGSMITH_TRACING"] = "true"
+    target_env["LANGSMITH_API_KEY"] = api_key
+    target_env["LANGSMITH_PROJECT"] = config.LANGSMITH_PROJECT
+    target_env["LANGSMITH_ENDPOINT"] = config.LANGSMITH_ENDPOINT
+    return True
 
 
 config = Config()

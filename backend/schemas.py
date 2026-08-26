@@ -32,6 +32,20 @@ class ChatResponse(BaseModel):
     tool_rounds: int
     agent_rounds: int
     stop_reason: str
+    run_id: str
+    request_id: str = ""
+    latency_ms: int
+    llm_calls: int
+    llm_latency_ms: int
+    llm_retries: int
+    input_tokens: Optional[int] = None
+    output_tokens: Optional[int] = None
+    total_tokens: Optional[int] = None
+    retrieval_triggered: bool
+    cache_hit: Optional[bool] = None
+    requested_tools: list[str]
+    executed_tools: list[str]
+    tool_errors: int
 
 
 # ---- Conversations ----

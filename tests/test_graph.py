@@ -279,6 +279,11 @@ def test_run_stream_emits_real_model_chunks_and_complete_metadata(tmp_path):
     assert done_payload["agent_rounds"] == 1
     assert done_payload["run_id"]
     assert done_payload["latency_ms"] >= 0
+    assert done_payload["llm_calls"] == 1
+    assert done_payload["llm_retries"] == 0
+    assert done_payload["retrieval_triggered"] is False
+    assert done_payload["requested_tools"] == []
+    assert done_payload["executed_tools"] == []
     assert "user_profile" in done_payload
     assert "product_context" in done_payload
     graph.close()
@@ -350,4 +355,7 @@ def test_run_stream_emits_tool_lifecycle_events(tmp_path):
     )
     assert done["tool_rounds"] == 1
     assert done["stop_reason"] == "completed"
+    assert done["requested_tools"] == ["search"]
+    assert done["executed_tools"] == ["search"]
+    assert done["tool_errors"] == 0
     graph.close()

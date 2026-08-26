@@ -225,6 +225,18 @@ export function useChat() {
               agent_rounds: meta.agent_rounds,
               stop_reason: meta.stop_reason,
               latency_ms: meta.latency_ms,
+              request_id: meta.request_id,
+              llm_calls: meta.llm_calls,
+              llm_latency_ms: meta.llm_latency_ms,
+              llm_retries: meta.llm_retries,
+              input_tokens: meta.input_tokens,
+              output_tokens: meta.output_tokens,
+              total_tokens: meta.total_tokens,
+              retrieval_triggered: meta.retrieval_triggered,
+              cache_hit: meta.cache_hit,
+              requested_tools: meta.requested_tools,
+              executed_tools: meta.executed_tools,
+              tool_errors: meta.tool_errors,
             }).catch(() => {});
           } else {
             dispatch({ type: "REMOVE_EMPTY_ASSISTANT" });

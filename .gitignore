@@ -9,6 +9,7 @@ docs/
 # ---- Generated data ----
 data/
 !data/.gitkeep
+evals/results/
 
 # ---- Build ----
 frontend/dist/
