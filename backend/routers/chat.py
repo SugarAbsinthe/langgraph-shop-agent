@@ -114,6 +114,7 @@ async def chat(request: ChatRequest):
         requested_tools=result.get("requested_tools", []),
         executed_tools=result.get("executed_tools", []),
         tool_errors=result.get("tool_errors", 0),
+        retrieval_stats=result.get("retrieval_stats", {}),
     )
 
 

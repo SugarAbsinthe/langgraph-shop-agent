@@ -17,6 +17,7 @@ from typing import Optional
 from langchain.tools import tool
 
 from src.config import config
+from src.retrieval.index_manifest import resolve_collection_names
 
 # Module-level state
 _product_retriever = None
@@ -110,9 +111,11 @@ def get_reviews(product_id: int, aspect: str = "", top_k: int = 5) -> str:
         top_k: Max reviews to return (default 5).
     """
     import chromadb
-    client = chromadb.PersistentClient(path=str(Path(_reviews_db).parent / "product_chroma_db"))
+    persist_dir = str(Path(_reviews_db).parent / "product_chroma_db")
+    client = chromadb.PersistentClient(path=persist_dir)
     try:
-        col = client.get_collection("product_reviews")
+        collection_names, _ = resolve_collection_names(persist_dir)
+        col = client.get_collection(collection_names["reviews"])
     except Exception:
         return "评价数据暂时不可用"
 
@@ -320,9 +323,11 @@ def create_get_reviews(reviews_db: str):
         """
         import chromadb
         from pathlib import Path as _Path
-        client = chromadb.PersistentClient(path=str(_Path(reviews_db).parent / "product_chroma_db"))
+        persist_dir = str(_Path(reviews_db).parent / "product_chroma_db")
+        client = chromadb.PersistentClient(path=persist_dir)
         try:
-            col = client.get_collection("product_reviews")
+            collection_names, _ = resolve_collection_names(persist_dir)
+            col = client.get_collection(collection_names["reviews"])
         except Exception:
             return "评价数据暂时不可用"
 

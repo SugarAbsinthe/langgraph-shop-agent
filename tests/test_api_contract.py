@@ -41,6 +41,7 @@ class FakeAgent:
             "requested_tools": ["search_products"],
             "executed_tools": ["search_products"],
             "tool_errors": 0,
+            "retrieval_stats": {"returned_candidates": 3},
         }
 
 
@@ -60,6 +61,7 @@ def test_chat_response_includes_execution_metadata(monkeypatch):
     assert response.llm_calls == 2
     assert response.total_tokens == 20
     assert response.executed_tools == ["search_products"]
+    assert response.retrieval_stats == {"returned_candidates": 3}
 
 
 def test_chat_error_does_not_expose_internal_exception(monkeypatch):

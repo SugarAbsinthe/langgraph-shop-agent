@@ -7,7 +7,12 @@ from langchain_core.language_models.chat_models import BaseChatModel
 from langchain_core.messages import AIMessage, AIMessageChunk, HumanMessage, ToolMessage
 from langchain_core.outputs import ChatGeneration, ChatGenerationChunk, ChatResult
 from langchain_core.tools import tool
-from src.agent.langgraph_engine import ShoppingGuideGraph, ShoppingState, classify_stage
+from src.agent.langgraph_engine import (
+    ShoppingGuideGraph,
+    ShoppingState,
+    build_retrieval_constraints,
+    classify_stage,
+)
 
 
 def _make_tool_call_msg(tool_call_id="call_1", tool_name="search"):
@@ -157,6 +162,22 @@ class FakeProfileStore:
 
     def update(self, *args, **kwargs):
         return None
+
+
+def test_profile_constraints_are_structured_and_exclusion_wins_conflict():
+    constraints = build_retrieval_constraints({
+        "budget": {"value": "5000-8000"},
+        "product_category": {"value": "笔记本电脑"},
+        "preferred_brand": {"value": "联想"},
+        "exclude_brand": {"value": "联想"},
+        "untrusted_field": {"value": "ignored"},
+    })
+    assert constraints == {
+        "min_price": 5000,
+        "max_price": 8000,
+        "category": "笔记本电脑",
+        "excluded_brands": ["联想"],
+    }
 
 
 def _lifecycle_graph(responses, max_tool_rounds=3):

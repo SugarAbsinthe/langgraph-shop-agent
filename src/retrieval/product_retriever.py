@@ -1,193 +1,399 @@
-"""Product retriever for shopping guide Agent.
+"""Hybrid product retrieval with independently ranked recall channels."""
 
-Three-level retrieval pipeline:
-  1. product_descriptions — semantic match on full product descriptions
-  2. product_specs — attribute-level matching for specific requirements
-     (e.g. "RTX 4060" may match a spec row even if the description doesn't
-     explicitly mention it)
-  3. product_reviews — user feedback filtered to already-matched products
+from __future__ import annotations
 
-Why three levels instead of one:
-  A single collection would force a choice between broad coverage (descriptions
-  are vague) and precision (specs are specific but lose context). Layering lets
-  each collection do what it's best at: descriptions for initial recall, specs
-  to catch missed matches, reviews for qualitative signal. The product_id-based
-  dedup across levels keeps the final result set clean.
-"""
 import json
+import re
 import sqlite3
-from typing import Optional
+import time
+from collections import defaultdict
+from pathlib import Path
+from typing import Any, Optional
 
-from sentence_transformers import SentenceTransformer
 import chromadb
+from sentence_transformers import SentenceTransformer
+
+from src.retrieval.models import (
+    ProductCandidate,
+    RetrievalConstraints,
+    RetrievalQuery,
+    RetrievalResult,
+    RetrievalStats,
+)
+from src.retrieval.index_manifest import resolve_collection_names
+
+
+RETRIEVAL_ALGORITHM_VERSION = "hybrid-rrf-v1"
+RRF_K = 60
+
+
+def reciprocal_rank_fusion(
+    ranked_ids: dict[str, list[int]], rrf_k: int = RRF_K
+) -> tuple[list[int], dict[int, float], dict[int, dict[str, int]]]:
+    """Fuse rank-only lists without comparing incompatible distance scales."""
+    scores: dict[int, float] = defaultdict(float)
+    source_ranks: dict[int, dict[str, int]] = defaultdict(dict)
+    for source, product_ids in ranked_ids.items():
+        seen: set[int] = set()
+        for rank, product_id in enumerate(product_ids, start=1):
+            if product_id in seen:
+                continue
+            seen.add(product_id)
+            scores[product_id] += 1.0 / (rrf_k + rank)
+            source_ranks[product_id][source] = rank
+    ordered = sorted(scores, key=lambda pid: (-scores[pid], pid))
+    return ordered, dict(scores), dict(source_ranks)
 
 
 class ProductRetriever:
-    """Hybrid product retrieval across descriptions, specs, and reviews."""
+    """Retrieve products through description, spec, and FTS5 channels."""
 
-    def __init__(self, chroma_dir: str, embedding_model: str = "BAAI/bge-small-zh-v1.5",
-                 catalog_db: str = None, cache=None):
-        self.model = SentenceTransformer(embedding_model)
-        self.client = chromadb.PersistentClient(path=chroma_dir)
-        self.desc_col = self.client.get_collection("product_descriptions")
-        self.spec_col = self.client.get_collection("product_specs")
-        self.review_col = self.client.get_collection("product_reviews")
+    def __init__(
+        self,
+        chroma_dir: str,
+        embedding_model: str = "BAAI/bge-small-zh-v1.5",
+        catalog_db: str | None = None,
+        cache=None,
+        *,
+        model=None,
+        client=None,
+    ):
+        self.model = model or SentenceTransformer(embedding_model)
+        self.client = client or chromadb.PersistentClient(path=chroma_dir)
+        collection_names, self.index_version = resolve_collection_names(chroma_dir)
+        self.desc_col = self.client.get_collection(collection_names["descriptions"])
+        self.spec_col = self.client.get_collection(collection_names["specs"])
+        self.review_col = self.client.get_collection(collection_names["reviews"])
         self.catalog_db = catalog_db
         self._cache = cache
+        self._sparse_conn: sqlite3.Connection | None = None
+        self._sparse_available = False
+        self._initialize_sparse_index()
 
-    def retrieve(self, query: str, top_k: int = 5,
-                 filters: Optional[dict] = None) -> str:
-        """Retrieve and format product context for the LLM prompt."""
-        # Check RAG cache first (Redis miss returns None → fall through)
-        if self._cache is not None and filters is None:
-            cached = self._cache.get(query, top_k)
+    def _initialize_sparse_index(self) -> None:
+        """Build a process-local FTS index; never mutate the catalog database."""
+        if not self.catalog_db or not Path(self.catalog_db).is_file():
+            return
+        try:
+            catalog = sqlite3.connect(
+                f"file:{Path(self.catalog_db).resolve()}?mode=ro", uri=True
+            )
+            catalog.row_factory = sqlite3.Row
+            rows = catalog.execute(
+                "SELECT product_id, name, brand, category, subcategory, "
+                "description, specs FROM products ORDER BY product_id"
+            ).fetchall()
+            catalog.close()
+            sparse = sqlite3.connect(":memory:")
+            sparse.execute(
+                "CREATE VIRTUAL TABLE product_fts USING fts5("
+                "product_id UNINDEXED, searchable, tokenize='trigram')"
+            )
+            sparse.executemany(
+                "INSERT INTO product_fts(product_id, searchable) VALUES (?, ?)",
+                [
+                    (
+                        row["product_id"],
+                        " ".join(
+                            str(row[key] or "")
+                            for key in (
+                                "name", "brand", "category", "subcategory",
+                                "description", "specs",
+                            )
+                        ),
+                    )
+                    for row in rows
+                ],
+            )
+            self._sparse_conn = sparse
+            self._sparse_available = True
+        except (OSError, sqlite3.Error):
+            self._sparse_conn = None
+            self._sparse_available = False
+
+    @staticmethod
+    def _metadata_ids(results: dict[str, Any]) -> list[int]:
+        metadatas = results.get("metadatas") or []
+        if not metadatas or not metadatas[0]:
+            return []
+        product_ids: list[int] = []
+        for metadata in metadatas[0]:
+            try:
+                product_ids.append(int(metadata["product_id"]))
+            except (KeyError, TypeError, ValueError):
+                continue
+        return product_ids
+
+    def _vector_recall(
+        self, collection, query_embedding: list[float], limit: int
+    ) -> list[int]:
+        results = collection.query(
+            query_embeddings=[query_embedding],
+            n_results=limit,
+            include=["metadatas"],
+        )
+        return self._metadata_ids(results)
+
+    def _sparse_recall(self, query: str, limit: int) -> tuple[list[int], bool]:
+        if not self._sparse_available or self._sparse_conn is None:
+            return [], True
+        user_query = query.splitlines()[0]
+        raw_terms = re.findall(r"[\u4e00-\u9fff]+|[A-Za-z0-9][A-Za-z0-9._-]*", user_query)
+        terms: list[str] = []
+        for term in raw_terms:
+            if re.fullmatch(r"[\u4e00-\u9fff]+", term) and len(term) > 3:
+                terms.extend(term[index : index + 3] for index in range(len(term) - 2))
+            elif len(term) >= 3:
+                terms.append(term)
+        terms = list(dict.fromkeys(terms))[:20]
+        if not terms:
+            return [], False
+        expression = " OR ".join(
+            f'"{term.replace(chr(34), chr(34) * 2)}"' for term in terms
+        )
+        try:
+            rows = self._sparse_conn.execute(
+                "SELECT product_id FROM product_fts WHERE searchable MATCH ? "
+                "ORDER BY bm25(product_fts) LIMIT ?",
+                (expression, limit),
+            ).fetchall()
+            return [int(row[0]) for row in rows], False
+        except sqlite3.Error:
+            return [], True
+
+    def _load_catalog_products(self, product_ids: list[int]) -> dict[int, ProductCandidate]:
+        if not product_ids or not self.catalog_db:
+            return {}
+        placeholders = ",".join("?" for _ in product_ids)
+        try:
+            conn = sqlite3.connect(
+                f"file:{Path(self.catalog_db).resolve()}?mode=ro", uri=True
+            )
+            conn.row_factory = sqlite3.Row
+            rows = conn.execute(
+                "SELECT product_id, name, brand, category, subcategory, price, "
+                "rating, sales_count, release_date, description, specs "
+                f"FROM products WHERE product_id IN ({placeholders})",
+                product_ids,
+            ).fetchall()
+            conn.close()
+        except (OSError, sqlite3.Error):
+            return {}
+
+        products: dict[int, ProductCandidate] = {}
+        for row in rows:
+            try:
+                specs = json.loads(row["specs"]) if row["specs"] else {}
+            except (TypeError, json.JSONDecodeError):
+                specs = {}
+            product = ProductCandidate(
+                product_id=row["product_id"],
+                name=row["name"] or "",
+                brand=row["brand"] or "",
+                category=row["category"] or "",
+                subcategory=row["subcategory"] or "",
+                price=row["price"],
+                rating=row["rating"],
+                sales_count=row["sales_count"],
+                release_date=row["release_date"] or "",
+                description=row["description"] or "",
+                specs=specs,
+            )
+            products[product.product_id] = product
+        return products
+
+    @staticmethod
+    def _matches_constraints(
+        product: ProductCandidate, constraints: RetrievalConstraints
+    ) -> bool:
+        if constraints.min_price is not None and (
+            product.price is None or product.price < constraints.min_price
+        ):
+            return False
+        if constraints.max_price is not None and (
+            product.price is None or product.price > constraints.max_price
+        ):
+            return False
+        if constraints.category and product.category.casefold() != constraints.category.casefold():
+            return False
+        excluded = {brand.casefold() for brand in constraints.excluded_brands}
+        if product.brand.casefold() in excluded:
+            return False
+        return True
+
+    @staticmethod
+    def _rerank_bonus(
+        product: ProductCandidate, query: str, constraints: RetrievalConstraints
+    ) -> float:
+        normalized_query = re.sub(r"\s+", "", query).casefold()
+        name = re.sub(r"\s+", "", product.name).casefold()
+        searchable_specs = re.sub(
+            r"\s+", "", json.dumps(product.specs, ensure_ascii=False)
+        ).casefold()
+        bonus = 0.0
+        if len(normalized_query) >= 3 and normalized_query in name:
+            bonus += 0.02
+        compact_terms = [
+            term.casefold()
+            for term in re.findall(r"[A-Za-z]+\s*\d+[A-Za-z0-9-]*", query)
+        ]
+        if any(re.sub(r"\s+", "", term) in searchable_specs for term in compact_terms):
+            bonus += 0.01
+        preferred = {brand.casefold() for brand in constraints.preferred_brands}
+        if product.brand.casefold() in preferred:
+            bonus += 0.005
+        return bonus
+
+    def _retrieve_reviews(
+        self, query_embedding: list[float], product_ids: list[int], top_k: int
+    ) -> dict[int, list[dict[str, str]]]:
+        if not product_ids:
+            return {}
+        try:
+            results = self.review_col.query(
+                query_embeddings=[query_embedding],
+                n_results=max(top_k * 3, 1),
+                where={"product_id": {"$in": product_ids[:10]}},
+                include=["documents", "metadatas"],
+            )
+        except Exception:
+            return {}
+        reviews: dict[int, list[dict[str, str]]] = defaultdict(list)
+        documents = (results.get("documents") or [[]])[0]
+        metadatas = (results.get("metadatas") or [[]])[0]
+        for document, metadata in zip(documents, metadatas):
+            try:
+                product_id = int(metadata["product_id"])
+            except (KeyError, TypeError, ValueError):
+                continue
+            reviews[product_id].append({
+                "aspect": str(metadata.get("aspect", "")),
+                "sentiment": str(metadata.get("sentiment", "")),
+                "content": str(document),
+            })
+        return dict(reviews)
+
+    def search(
+        self,
+        query: str | RetrievalQuery,
+        top_k: int = 5,
+        filters: Optional[dict] = None,
+    ) -> RetrievalResult:
+        """Return structured, auditable retrieval results."""
+        started = time.perf_counter()
+        request = query if isinstance(query, RetrievalQuery) else RetrievalQuery(
+            text=query, top_k=top_k, constraints=filters or {}
+        )
+        overfetch = min(request.top_k * 3, 60)
+        query_embedding = self.model.encode(request.text).tolist()
+        description_ids = self._vector_recall(self.desc_col, query_embedding, overfetch)
+        spec_ids = self._vector_recall(self.spec_col, query_embedding, overfetch)
+        sparse_ids, sparse_fallback = self._sparse_recall(request.text, overfetch)
+
+        ranked_ids = {
+            "description": description_ids,
+            "spec": spec_ids,
+            "sparse": sparse_ids,
+        }
+        ordered_ids, scores, source_ranks = reciprocal_rank_fusion(ranked_ids)
+        catalog_products = self._load_catalog_products(ordered_ids)
+        filtered_count = 0
+        candidates: list[ProductCandidate] = []
+        for product_id in ordered_ids:
+            product = catalog_products.get(product_id)
+            if product is None or not self._matches_constraints(product, request.constraints):
+                filtered_count += 1
+                continue
+            ranks = source_ranks[product_id]
+            product.sources = list(ranks)
+            product.source_ranks = ranks
+            product.score = scores[product_id] + self._rerank_bonus(
+                product, request.text, request.constraints
+            )
+            candidates.append(product)
+
+        candidates.sort(key=lambda item: (-item.score, item.product_id))
+        products = candidates[: request.top_k]
+        product_ids = [product.product_id for product in products]
+        reviews = self._retrieve_reviews(query_embedding, product_ids, request.top_k)
+        stats = RetrievalStats(
+            source_hits={source: len(set(ids)) for source, ids in ranked_ids.items()},
+            fused_candidates=len(ordered_ids),
+            filtered_candidates=filtered_count,
+            returned_candidates=len(products),
+            sparse_fallback=sparse_fallback,
+            index_version=self.index_version,
+            duration_ms=round((time.perf_counter() - started) * 1000),
+        )
+        from backend.logging_config import record_retrieval_stats
+
+        record_retrieval_stats(stats)
+        return RetrievalResult(products=products, reviews_by_product=reviews, stats=stats)
+
+    def retrieve(
+        self, query: str, top_k: int = 5, filters: Optional[dict] = None
+    ) -> str:
+        """Compatibility API used by the Agent and search tool."""
+        cache_args = (
+            query,
+            top_k,
+            filters,
+            self.index_version,
+            RETRIEVAL_ALGORITHM_VERSION,
+        )
+        if self._cache is not None:
+            cached = self._cache.get(*cache_args)
             if cached is not None:
                 from backend.logging_config import log, mark_cache_hit
+
                 mark_cache_hit()
                 log("rag_cache_hit")
                 return cached
-
-        where = None
-        if filters:
-            where = {}
-            for k, v in filters.items():
-                if isinstance(v, list):
-                    where[k] = {"$in": v}
-                else:
-                    where[k] = v
-
-        query_embedding = self.model.encode(query).tolist()
-
-        # 1. Product descriptions
-        desc_results = self.desc_col.query(
-            query_embeddings=[query_embedding],
-            n_results=top_k,
-            where=where,
-            include=["documents", "metadatas", "distances"],
-        )
-        seen_ids = set()
-        products = []
-        if desc_results["ids"] and desc_results["ids"][0]:
-            for i, _pid in enumerate(desc_results["ids"][0]):
-                meta = desc_results["metadatas"][0][i]
-                prod_id = meta["product_id"]
-                if prod_id not in seen_ids:
-                    seen_ids.add(prod_id)
-                    products.append(meta)
-
-        # 2. Broaden search via specs
-        if len(products) < top_k:
-            spec_results = self.spec_col.query(
-                query_embeddings=[query_embedding],
-                n_results=top_k * 3,
-                where=where,
-                include=["metadatas"],
+        result = self.search(query, top_k=top_k, filters=filters)
+        formatted = self._format_for_prompt(result.products, result.reviews_by_product)
+        if self._cache is not None:
+            self._cache.set(
+                query,
+                top_k,
+                formatted,
+                filters,
+                self.index_version,
+                RETRIEVAL_ALGORITHM_VERSION,
             )
-            if spec_results["ids"] and spec_results["ids"][0]:
-                for i, _sid in enumerate(spec_results["ids"][0]):
-                    meta = spec_results["metadatas"][0][i]
-                    prod_id = meta["product_id"]
-                    if prod_id not in seen_ids:
-                        seen_ids.add(prod_id)
-                        products.append({
-                            "product_id": prod_id,
-                            "name": meta["product_name"],
-                            "brand": meta["brand"],
-                            "category": meta["category"],
-                            "subcategory": meta["subcategory"],
-                        })
-                    if len(products) >= top_k:
-                        break
+        return formatted
 
-        # 3. Retrieve relevant reviews
-        matched_pids = [p["product_id"] for p in products]
-        reviews_by_pid = {}
-        if matched_pids:
-            review_results = self.review_col.query(
-                query_embeddings=[query_embedding],
-                n_results=top_k * 3,
-                where={"product_id": {"$in": matched_pids[:10]}},
-                include=["documents", "metadatas"],
-            )
-            if review_results["ids"] and review_results["ids"][0]:
-                for i, _rid in enumerate(review_results["ids"][0]):
-                    meta = review_results["metadatas"][0][i]
-                    rev_pid = meta["product_id"]
-                    text = review_results["documents"][0][i]
-                    if rev_pid not in reviews_by_pid:
-                        reviews_by_pid[rev_pid] = []
-                    reviews_by_pid[rev_pid].append({
-                        "aspect": meta["aspect"],
-                        "sentiment": meta["sentiment"],
-                        "content": text,
-                    })
-
-        result = self._format_for_prompt(products, reviews_by_pid)
-
-        # Store in cache for subsequent identical queries
-        if self._cache is not None and filters is None:
-            self._cache.set(query, top_k, result)
-
-        return result
-
-    def _format_for_prompt(self, products: list[dict],
-                           reviews_by_pid: dict) -> str:
-        """Format retrieved products, with full specs from catalog."""
+    def _format_for_prompt(
+        self,
+        products: list[ProductCandidate],
+        reviews_by_pid: dict[int, list[dict[str, str]]],
+    ) -> str:
         lines = ["## 相关产品推荐\n"]
-
-        # Pre-load specs from SQLite catalog for rich display
-        specs_by_pid = {}
-        desc_by_pid = {}
-        if self.catalog_db:
-            try:
-                conn = sqlite3.connect(self.catalog_db)
-                conn.row_factory = sqlite3.Row
-                pids = [p["product_id"] for p in products if "product_id" in p]
-                if pids:
-                    placeholders = ",".join("?" * len(pids))
-                    rows = conn.execute(
-                        f"SELECT product_id, specs, description FROM products WHERE product_id IN ({placeholders})",
-                        pids
-                    ).fetchall()
-                    for row in rows:
-                        specs_by_pid[row["product_id"]] = row["specs"]
-                        desc_by_pid[row["product_id"]] = row["description"]
-                conn.close()
-            except Exception:
-                pass
-
-        for i, p in enumerate(products):
-            pid = p.get("product_id")
-
-            lines.append(f"### {i+1}. {p.get('name', '?')}")
-            lines.append(f"- 品牌: {p.get('brand', '?')} | 品类: {p.get('category', '?')} / {p.get('subcategory', '?')}")
-            lines.append(f"- 价格: RMB{p.get('price', '?')} | 评分: {p.get('rating', '?')} 分 | 销量: {p.get('sales_count', 0)}")
-            lines.append(f"- 发布日期: {p.get('release_date', '?')} | 产品ID: {pid}")
-
-            # Rich spec details from catalog
-            desc = desc_by_pid.get(pid, "")
-            if desc:
-                lines.append(f"- 产品简介: {desc}")
-
-            spec_json = specs_by_pid.get(pid, "")
-            if spec_json:
-                try:
-                    specs = json.loads(spec_json) if isinstance(spec_json, str) else spec_json
-                    spec_lines = []
-                    for k, v in specs.items():
-                        spec_lines.append(f"  {k}: {v}")
-                    if spec_lines:
-                        lines.append("- 规格参数:")
-                        lines.extend(spec_lines)
-                except Exception:
-                    pass
-
-            # Review summary
-            if pid in reviews_by_pid:
+        if not products:
+            lines.append("未找到满足当前约束的商品。")
+            return "\n".join(lines)
+        for index, product in enumerate(products, start=1):
+            lines.append(f"### {index}. {product.name or '?'}")
+            lines.append(
+                f"- 品牌: {product.brand or '?'} | 品类: "
+                f"{product.category or '?'} / {product.subcategory or '?'}"
+            )
+            lines.append(
+                f"- 价格: RMB{product.price if product.price is not None else '?'} | "
+                f"评分: {product.rating if product.rating is not None else '?'} 分 | "
+                f"销量: {product.sales_count or 0}"
+            )
+            lines.append(
+                f"- 发布日期: {product.release_date or '?'} | 产品ID: {product.product_id}"
+            )
+            if product.description:
+                lines.append(f"- 产品简介: {product.description}")
+            if product.specs:
+                lines.append("- 规格参数:")
+                lines.extend(f"  {key}: {value}" for key, value in product.specs.items())
+            if product.product_id in reviews_by_pid:
                 lines.append("- 用户评价摘要:")
-                for rev in reviews_by_pid[pid][:3]:
-                    emoji = "+" if rev["sentiment"] == "positive" else "-"
-                    lines.append(f"  [{emoji}] {rev['aspect']}: {rev['content']}")
+                for review in reviews_by_pid[product.product_id][:3]:
+                    marker = "+" if review["sentiment"] == "positive" else "-"
+                    lines.append(f"  [{marker}] {review['aspect']}: {review['content']}")
             lines.append("")
-
         return "\n".join(lines)

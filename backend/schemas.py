@@ -46,6 +46,7 @@ class ChatResponse(BaseModel):
     requested_tools: list[str]
     executed_tools: list[str]
     tool_errors: int
+    retrieval_stats: dict = Field(default_factory=dict)
 
 
 # ---- Conversations ----

@@ -53,6 +53,7 @@ class ShoppingState(TypedDict, total=False):
     tool_rounds: int
     agent_rounds: int
     stop_reason: str
+    profile_constraints: dict
 
 
 class ShoppingGuideGraph:
@@ -143,15 +144,19 @@ class ShoppingGuideGraph:
 
         # Reload profile after extraction
         user_profile = self.profile_store.serialize_profile(conv_id)
+        structured_getter = getattr(self.profile_store, "get_structured", None)
+        structured_profile = structured_getter(conv_id) if structured_getter else {}
 
         return {
             "stage": stage,
             "user_profile": user_profile,
+            "profile_constraints": build_retrieval_constraints(structured_profile),
         }
 
     def _retrieve_node(self, state: ShoppingState) -> dict:
         stage = state.get("stage", "discovery")
         user_profile = state.get("user_profile", "")
+        profile_constraints = state.get("profile_constraints", {})
         messages = state["messages"]
 
         # Only search products in relevant stages
@@ -176,7 +181,12 @@ class ShoppingGuideGraph:
             augmented_query = f"{last_user_msg}\n用户画像: {user_profile}"
 
         try:
-            product_context = self.product_retriever.retrieve(augmented_query, top_k=5)
+            retrieve_kwargs = {"top_k": 5}
+            if profile_constraints:
+                retrieve_kwargs["filters"] = profile_constraints
+            product_context = self.product_retriever.retrieve(
+                augmented_query, **retrieve_kwargs
+            )
         except Exception:
             product_context = "(产品检索暂时不可用)"
 
@@ -579,6 +589,35 @@ class ShoppingGuideGraph:
 
 
 # ---- Standalone helpers (usable by both old and new architecture) ----
+
+
+def build_retrieval_constraints(structured_profile: dict) -> dict:
+    """Map trusted profile fields to retrieval filters; ignore unknown keys."""
+    import re
+
+    def value(key: str) -> str:
+        item = structured_profile.get(key, {})
+        return str(item.get("value", "")) if isinstance(item, dict) else ""
+
+    constraints: dict = {}
+    budget_numbers = [int(item) for item in re.findall(r"\d+", value("budget"))[:2]]
+    if len(budget_numbers) == 1:
+        constraints["max_price"] = budget_numbers[0]
+    elif len(budget_numbers) == 2:
+        constraints["min_price"], constraints["max_price"] = sorted(budget_numbers)
+
+    category = value("product_category").strip()
+    if category:
+        constraints["category"] = category
+    preferred = value("preferred_brand").strip()
+    excluded = value("exclude_brand").strip()
+    if preferred:
+        constraints["preferred_brands"] = [preferred]
+    if excluded:
+        constraints["excluded_brands"] = [excluded]
+        if preferred.casefold() == excluded.casefold():
+            constraints.pop("preferred_brands", None)
+    return constraints
 
 
 def classify_stage(user_message: str, current_stage: str, llm=None,

@@ -5,6 +5,7 @@ On Redis miss or Redis-unavailable, falls through gracefully to normal retrieval
 """
 
 import hashlib
+import json
 import logging
 from typing import Optional
 
@@ -48,26 +49,66 @@ class RAGCache:
             )
             self._redis = None
 
-    def _make_key(self, query: str, top_k: int) -> str:
+    def _make_key(
+        self,
+        query: str,
+        top_k: int,
+        filters: Optional[dict] = None,
+        index_version: str = "legacy",
+        algorithm_version: str = "legacy",
+    ) -> str:
         """Build a stable cache key from the retrieval parameters."""
-        payload = f"{query}|{top_k}"
+        payload = json.dumps(
+            {
+                "query": " ".join(query.split()),
+                "top_k": top_k,
+                "filters": filters or {},
+                "index_version": index_version,
+                "algorithm_version": algorithm_version,
+            },
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
         digest = hashlib.md5(payload.encode("utf-8")).hexdigest()
         return f"{self._prefix}:{digest}"
 
-    def get(self, query: str, top_k: int) -> Optional[str]:
+    def get(
+        self,
+        query: str,
+        top_k: int,
+        filters: Optional[dict] = None,
+        index_version: str = "legacy",
+        algorithm_version: str = "legacy",
+    ) -> Optional[str]:
         """Return cached retrieval result or None on miss/unavailable."""
         if self._redis is None:
             return None
         try:
-            return self._redis.get(self._make_key(query, top_k))
+            return self._redis.get(
+                self._make_key(
+                    query, top_k, filters, index_version, algorithm_version
+                )
+            )
         except Exception:
             return None
 
-    def set(self, query: str, top_k: int, value: str) -> None:
+    def set(
+        self,
+        query: str,
+        top_k: int,
+        value: str,
+        filters: Optional[dict] = None,
+        index_version: str = "legacy",
+        algorithm_version: str = "legacy",
+    ) -> None:
         """Store retrieval result with TTL. Errors are silently swallowed."""
         if self._redis is None:
             return
         try:
-            self._redis.setex(self._make_key(query, top_k), self._ttl, value)
+            key = self._make_key(
+                query, top_k, filters, index_version, algorithm_version
+            )
+            self._redis.setex(key, self._ttl, value)
         except Exception:
             pass

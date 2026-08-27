@@ -1,0 +1,30 @@
+{"id":"exact_legion_model","query":"联想拯救者 Pro 5","relevant_ids":[1],"required_sources":["sparse"],"tags":["exact_model"]}
+{"id":"exact_xiaoxin_model","query":"小新 Pro 14 32GB","relevant_ids":[3],"required_sources":["sparse","spec"],"tags":["exact_model","spec"]}
+{"id":"rtx4060_laptops","query":"RTX4060 游戏本","relevant_ids":[1,8,14],"required_sources":["spec"],"tags":["spec","gaming"]}
+{"id":"rtx4070_laptop","query":"RTX4070 高性能笔记本","relevant_ids":[2],"required_sources":["spec"],"tags":["spec"]}
+{"id":"gaming_under_8000","query":"预算8000以内的游戏本","constraints":{"max_price":8000,"category":"笔记本电脑"},"relevant_ids":[8,14],"forbidden_ids":[1,2],"tags":["budget","gaming"]}
+{"id":"gaming_under_7000","query":"7000元以下能玩3A的笔记本","constraints":{"max_price":7000,"category":"笔记本电脑"},"relevant_ids":[8],"forbidden_ids":[1,2,14],"tags":["budget","gaming"]}
+{"id":"light_office_under_6000","query":"6000以内轻薄办公本","constraints":{"max_price":6000,"category":"笔记本电脑"},"relevant_ids":[3,5,15],"tags":["budget","office","mobility"]}
+{"id":"coding_under_7000","query":"预算7000以内用于编程的轻薄笔记本","constraints":{"max_price":7000,"category":"笔记本电脑"},"relevant_ids":[3,7,15],"tags":["budget","coding"]}
+{"id":"coding_exclude_lenovo","query":"编程办公笔记本，不要联想","constraints":{"category":"笔记本电脑","excluded_brands":["联想"]},"relevant_ids":[6,7,15],"forbidden_ids":[1,3,13],"tags":["exclude_brand","coding"]}
+{"id":"prefer_lenovo_office","query":"联想办公笔记本","constraints":{"category":"笔记本电脑","preferred_brands":["联想"]},"relevant_ids":[3,13],"tags":["preferred_brand","office"]}
+{"id":"portable_exclude_dell","query":"轻薄便携办公，不要戴尔","constraints":{"category":"笔记本电脑","excluded_brands":["戴尔"]},"relevant_ids":[3,6,7,15],"forbidden_ids":[4],"tags":["exclude_brand","mobility"]}
+{"id":"student_under_5000","query":"学生用的5000元以内笔记本","constraints":{"max_price":5000,"category":"笔记本电脑"},"relevant_ids":[5],"tags":["student","budget"]}
+{"id":"premium_gaming","query":"高性能旗舰游戏本，预算充足","constraints":{"category":"笔记本电脑"},"relevant_ids":[2,1],"tags":["gaming","premium"]}
+{"id":"battery_portable","query":"续航好而且方便出差携带的电脑","constraints":{"category":"笔记本电脑"},"relevant_ids":[6,13,15],"required_sources":["description"],"tags":["battery","mobility"]}
+{"id":"macbook_coding","query":"MacBook 编程开发","constraints":{"category":"笔记本电脑","preferred_brands":["苹果"]},"relevant_ids":[6],"tags":["brand","coding"]}
+{"id":"phone_photography","query":"拍照好的旗舰手机","constraints":{"category":"手机"},"relevant_ids":[9,10],"tags":["category","phone"]}
+{"id":"huawei_phone","query":"华为 Mate 手机","constraints":{"category":"手机","preferred_brands":["华为"]},"relevant_ids":[10],"tags":["brand","phone"]}
+{"id":"tablet_study","query":"适合学习记笔记的平板","constraints":{"category":"平板电脑"},"relevant_ids":[12],"tags":["category","tablet"]}
+{"id":"noise_cancel_headphones","query":"降噪效果好的无线耳机","constraints":{"category":"无线耳机"},"relevant_ids":[11],"tags":["category","headphones"]}
+{"id":"laptop_category_isolation","query":"办公电脑","constraints":{"category":"笔记本电脑"},"relevant_ids":[3,5,6,7,13,15],"forbidden_ids":[9,10,11,12],"tags":["category","boundary"]}
+{"id":"no_gaming_under_4000","query":"4000元以内的高性能游戏本","constraints":{"max_price":4000,"category":"笔记本电脑"},"relevant_ids":[],"forbidden_ids":[1,2,8,14],"tags":["empty","budget"]}
+{"id":"office_under_11000_exclude_dell","query":"一万一以内办公笔记本，不要戴尔","constraints":{"max_price":11000,"category":"笔记本电脑","excluded_brands":["戴尔"]},"relevant_ids":[3,5,6,7,15],"forbidden_ids":[4],"tags":["budget","exclude_brand"]}
+{"id":"memory_32gb","query":"32GB内存的轻薄笔记本","constraints":{"category":"笔记本电脑"},"relevant_ids":[3],"required_sources":["spec"],"tags":["spec","memory"]}
+{"id":"lenovo_asus_candidates","query":"联想和华硕游戏本候选","constraints":{"category":"笔记本电脑"},"relevant_ids":[1,2,14],"tags":["brand","comparison"]}
+{"id":"gaming_thermal_reviews","query":"散热和噪音表现好的游戏本","constraints":{"category":"笔记本电脑"},"relevant_ids":[1,2,8,14],"tags":["reviews","gaming"]}
+{"id":"english_gaming_query","query":"RTX 4060 gaming laptop under 8000","constraints":{"max_price":8000,"category":"笔记本电脑"},"relevant_ids":[8,14],"required_sources":["spec"],"tags":["english","spec","budget"]}
+{"id":"mixed_mac_office","query":"MacBook 日常办公轻薄","constraints":{"category":"笔记本电脑","preferred_brands":["苹果"]},"relevant_ids":[6],"tags":["mixed_language","brand"]}
+{"id":"phone_exclude_huawei","query":"拍照手机但不要华为","constraints":{"category":"手机","excluded_brands":["华为"]},"relevant_ids":[9],"forbidden_ids":[10],"tags":["exclude_brand","phone"]}
+{"id":"coding_exclude_apple_under_7000","query":"7000以内轻薄编程本，不要苹果","constraints":{"max_price":7000,"category":"笔记本电脑","excluded_brands":["苹果"]},"relevant_ids":[3,7,15],"forbidden_ids":[6],"tags":["multi_constraint","coding"]}
+{"id":"profile_budget_and_exclusion","query":"给我推荐办公笔记本","profile":{"budget":"5000-6500","primary_use":"office","exclude_brand":"戴尔"},"constraints":{"min_price":5000,"max_price":6500,"category":"笔记本电脑","excluded_brands":["戴尔"]},"relevant_ids":[3,7,15],"forbidden_ids":[4],"tags":["profile","multi_constraint"]}

@@ -56,6 +56,7 @@ class RunTelemetry:
     requested_tools: list[str] = field(default_factory=list)
     executed_tools: list[str] = field(default_factory=list)
     tool_errors: int = 0
+    retrieval_stats: dict[str, Any] = field(default_factory=dict)
 
     def snapshot(self) -> dict[str, Any]:
         return {
@@ -73,6 +74,7 @@ class RunTelemetry:
             "requested_tools": list(self.requested_tools),
             "executed_tools": list(self.executed_tools),
             "tool_errors": self.tool_errors,
+            "retrieval_stats": dict(self.retrieval_stats),
         }
 
 
@@ -159,6 +161,26 @@ def mark_cache_hit() -> None:
     if telemetry:
         telemetry.retrieval_triggered = True
         telemetry.cache_hit = True
+
+
+def record_retrieval_stats(stats: Any) -> None:
+    """Record aggregate retrieval counters without query or profile content."""
+    telemetry = get_run_telemetry()
+    if not telemetry:
+        return
+    payload = stats.model_dump() if hasattr(stats, "model_dump") else dict(stats)
+    allowed = {
+        "source_hits",
+        "fused_candidates",
+        "filtered_candidates",
+        "returned_candidates",
+        "sparse_fallback",
+        "index_version",
+        "duration_ms",
+    }
+    telemetry.retrieval_stats = {
+        key: payload[key] for key in allowed if key in payload
+    }
 
 
 def record_requested_tools(tool_names: Iterable[str]) -> None:

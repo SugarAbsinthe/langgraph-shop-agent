@@ -17,6 +17,7 @@ from backend.logging_config import (
     record_executed_tools,
     record_llm_response,
     record_llm_retry,
+    record_retrieval_stats,
     record_requested_tools,
     reset_request_id,
     run_context,
@@ -105,6 +106,12 @@ def test_run_telemetry_records_only_available_usage():
         record_llm_response(response)
         mark_retrieval()
         mark_cache_hit()
+        record_retrieval_stats({
+            "source_hits": {"description": 5, "spec": 4, "sparse": 2},
+            "returned_candidates": 3,
+            "index_version": "v2",
+            "query": "must-not-be-recorded",
+        })
         record_requested_tools(["search_products"])
         record_executed_tools(["search_products", "get_reviews"], ["success", "error"])
 
@@ -119,6 +126,8 @@ def test_run_telemetry_records_only_available_usage():
     assert snapshot["requested_tools"] == ["search_products"]
     assert snapshot["executed_tools"] == ["search_products", "get_reviews"]
     assert snapshot["tool_errors"] == 1
+    assert snapshot["retrieval_stats"]["returned_candidates"] == 3
+    assert "query" not in snapshot["retrieval_stats"]
 
 
 def test_langsmith_is_disabled_by_default(monkeypatch):

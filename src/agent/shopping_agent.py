@@ -137,6 +137,7 @@ class ShoppingGuideAgent:
             "requested_tools": result["requested_tools"],
             "executed_tools": result["executed_tools"],
             "tool_errors": result["tool_errors"],
+            "retrieval_stats": result["retrieval_stats"],
         }
 
     async def run_stream(self, question: str, conv_id: str = "default",

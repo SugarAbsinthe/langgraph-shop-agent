@@ -490,10 +490,12 @@ if st.button("检查组件状态", use_container_width=True):
         st.markdown("**ChromaDB 产品索引**")
         try:
             import chromadb
+            from src.retrieval.index_manifest import resolve_collection_names
             client = chromadb.PersistentClient(path=config.PRODUCT_CHROMA_DIR)
-            desc_n = client.get_collection("product_descriptions").count()
-            spec_n = client.get_collection("product_specs").count()
-            review_n = client.get_collection("product_reviews").count()
+            collection_names, _ = resolve_collection_names(config.PRODUCT_CHROMA_DIR)
+            desc_n = client.get_collection(collection_names["descriptions"]).count()
+            spec_n = client.get_collection(collection_names["specs"]).count()
+            review_n = client.get_collection(collection_names["reviews"]).count()
             st.success(f"✅ {desc_n} 产品 / {spec_n} 规格 / {review_n} 评价")
         except Exception as e:
             st.error(f"❌ {e}")

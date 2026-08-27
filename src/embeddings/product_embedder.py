@@ -1,122 +1,161 @@
-"""Generate product embeddings and store in ChromaDB for shopping guide RAG.
+"""Build versioned product embeddings and activate them only after validation."""
 
-Three collections:
-  product_descriptions — product-level natural language descriptions
-  product_specs         — individual spec fields extracted from JSON
-  product_reviews     — review snippets by aspect
-"""
+from __future__ import annotations
 
 import json
 import sqlite3
+import uuid
+from datetime import datetime, timezone
 from pathlib import Path
 
 import chromadb
 from sentence_transformers import SentenceTransformer
 
+from src.retrieval.index_manifest import activate_index_manifest
+
+
+def _rows(db_path: str, query: str) -> list[dict]:
+    conn = sqlite3.connect(f"file:{Path(db_path).resolve()}?mode=ro", uri=True)
+    conn.row_factory = sqlite3.Row
+    try:
+        return [dict(row) for row in conn.execute(query)]
+    finally:
+        conn.close()
+
+
+def _encode(model, documents: list[str]) -> list[list[float]]:
+    if not documents:
+        return []
+    embeddings = model.encode(documents)
+    return [embedding.tolist() for embedding in embeddings]
+
 
 def build_product_embeddings(
-    products_db: str, reviews_db: str, persist_dir: str, embedding_model_name: str
-) -> None:
-    print(f"Loading embedding model: {embedding_model_name}")
-    model = SentenceTransformer(embedding_model_name)
+    products_db: str,
+    reviews_db: str,
+    persist_dir: str,
+    embedding_model_name: str,
+    *,
+    batch_size: int = 64,
+    index_version: str | None = None,
+    model=None,
+    client=None,
+) -> dict:
+    """Build isolated collections; keep the old manifest active on failure."""
+    if batch_size < 1 or batch_size > 1000:
+        raise ValueError("batch_size must be between 1 and 1000")
+    version = index_version or (
+        datetime.now(timezone.utc).strftime("%Y%m%d%H%M%S") + "-" + uuid.uuid4().hex[:8]
+    )
+    safe_version = "".join(char for char in version if char.isalnum() or char in "-_")
+    if not safe_version or safe_version != version or len(version) > 64:
+        raise ValueError("index_version contains unsafe characters")
 
-    print("Connecting to ChromaDB...")
-    client = chromadb.PersistentClient(path=persist_dir)
+    embedding_model = model or SentenceTransformer(embedding_model_name)
+    chroma_client = client or chromadb.PersistentClient(path=persist_dir)
+    names = {
+        "descriptions": f"product_descriptions_{version}",
+        "specs": f"product_specs_{version}",
+        "reviews": f"product_reviews_{version}",
+    }
+    created: list[str] = []
+    try:
+        collections = {}
+        for key, name in names.items():
+            collections[key] = chroma_client.create_collection(name)
+            created.append(name)
 
-    for name in ["product_descriptions", "product_specs", "product_reviews"]:
-        try:
-            client.delete_collection(name)
-        except Exception:
-            pass
+        products = _rows(products_db, "SELECT * FROM products ORDER BY product_id")
+        reviews = _rows(reviews_db, "SELECT * FROM product_reviews ORDER BY review_id")
+        specs: list[dict] = []
+        for product in products:
+            for attribute, value in json.loads(product["specs"]).items():
+                specs.append({
+                    "id": f"spec_{product['product_id']}_{attribute}",
+                    "document": f"{product['name']}（{product['category']}）的{attribute}: {value}",
+                    "metadata": {
+                        "product_id": product["product_id"],
+                        "product_name": product["name"],
+                        "brand": product["brand"],
+                        "category": product["category"],
+                        "subcategory": product["subcategory"],
+                        "attribute": attribute,
+                        "value": str(value),
+                    },
+                })
 
-    desc_col = client.create_collection("product_descriptions")
-    spec_col = client.create_collection("product_specs")
-    review_col = client.create_collection("product_reviews")
+        datasets = {
+            "descriptions": [
+                {
+                    "id": f"product_{product['product_id']}",
+                    "document": product["description"],
+                    "metadata": {
+                        key: product[key]
+                        for key in (
+                            "product_id", "name", "brand", "category", "subcategory",
+                            "price", "rating", "sales_count", "release_date",
+                        )
+                    },
+                }
+                for product in products
+            ],
+            "specs": specs,
+            "reviews": [
+                {
+                    "id": f"review_{review['review_id']}",
+                    "document": f"[{review['sentiment']}] {review['aspect']}: {review['content']}",
+                    "metadata": {
+                        "product_id": review["product_id"],
+                        "aspect": review["aspect"],
+                        "sentiment": review["sentiment"],
+                    },
+                }
+                for review in reviews
+            ],
+        }
 
-    # Load products
-    conn = sqlite3.connect(products_db)
-    conn.row_factory = sqlite3.Row
-    products = [dict(r) for r in conn.execute("SELECT * FROM products ORDER BY product_id")]
-    conn.close()
+        for key, records in datasets.items():
+            collection = collections[key]
+            for start in range(0, len(records), batch_size):
+                batch = records[start : start + batch_size]
+                documents = [record["document"] for record in batch]
+                collection.add(
+                    ids=[record["id"] for record in batch],
+                    documents=documents,
+                    embeddings=_encode(embedding_model, documents),
+                    metadatas=[record["metadata"] for record in batch],
+                )
+            if collection.count() != len(records):
+                raise RuntimeError(f"index count mismatch for {key}")
 
-    # Level 1: Product descriptions
-    print(f"Embedding {len(products)} product descriptions...")
-    for p in products:
-        desc = p["description"]
-        embedding = model.encode(desc).tolist()
-        desc_col.add(
-            ids=[f"product_{p['product_id']}"],
-            documents=[desc],
-            embeddings=[embedding],
-            metadatas=[{
-                "product_id": p["product_id"],
-                "name": p["name"],
-                "brand": p["brand"],
-                "category": p["category"],
-                "subcategory": p["subcategory"],
-                "price": p["price"],
-                "rating": p["rating"],
-                "sales_count": p["sales_count"],
-                "release_date": p["release_date"],
-            }],
-        )
-
-    # Level 2: Individual specs
-    print("Embedding spec-level descriptions...")
-    for p in products:
-        specs = json.loads(p["specs"])
-        for attr, value in specs.items():
-            spec_text = f"{p['name']}（{p['category']}）的{attr}: {value}"
-            embedding = model.encode(spec_text).tolist()
-            spec_col.add(
-                ids=[f"spec_{p['product_id']}_{attr}"],
-                documents=[spec_text],
-                embeddings=[embedding],
-                metadatas=[{
-                    "product_id": p["product_id"],
-                    "product_name": p["name"],
-                    "brand": p["brand"],
-                    "category": p["category"],
-                    "subcategory": p["subcategory"],
-                    "attribute": attr,
-                    "value": str(value),
-                }],
-            )
-
-    # Level 3: Review snippets
-    conn = sqlite3.connect(reviews_db)
-    conn.row_factory = sqlite3.Row
-    reviews = [dict(r) for r in conn.execute("SELECT * FROM product_reviews ORDER BY review_id")]
-    conn.close()
-
-    print(f"Embedding {len(reviews)} review snippets...")
-    for r in reviews:
-        rtext = f"[{r['sentiment']}] {r['aspect']}: {r['content']}"
-        embedding = model.encode(rtext).tolist()
-        review_col.add(
-            ids=[f"review_{r['review_id']}"],
-            documents=[rtext],
-            embeddings=[embedding],
-            metadatas=[{
-                "product_id": r["product_id"],
-                "aspect": r["aspect"],
-                "sentiment": r["sentiment"],
-            }],
-        )
-
-    print(f"Done! Embeddings stored in {persist_dir}")
-    print(f"  product_descriptions: {desc_col.count()} entries")
-    print(f"  product_specs: {spec_col.count()} entries")
-    print(f"  product_reviews: {review_col.count()} entries")
+        manifest = {
+            "schema_version": 1,
+            "version": version,
+            "embedding_model": embedding_model_name,
+            "collections": names,
+            "counts": {key: len(records) for key, records in datasets.items()},
+            "created_at": datetime.now(timezone.utc).isoformat(),
+        }
+        activate_index_manifest(persist_dir, manifest)
+        return manifest
+    except Exception:
+        for name in created:
+            try:
+                chroma_client.delete_collection(name)
+            except Exception:
+                pass
+        raise
 
 
-def main():
+def main() -> None:
     base_dir = Path(__file__).resolve().parent.parent.parent
-    products_db = str(base_dir / "data" / "products.db")
-    reviews_db = str(base_dir / "data" / "product_reviews.db")
-    persist_dir = str(base_dir / "data" / "product_chroma_db")
-    embedding_model = "BAAI/bge-small-zh-v1.5"
-    build_product_embeddings(products_db, reviews_db, persist_dir, embedding_model)
+    manifest = build_product_embeddings(
+        str(base_dir / "data" / "products.db"),
+        str(base_dir / "data" / "product_reviews.db"),
+        str(base_dir / "data" / "product_chroma_db"),
+        "BAAI/bge-small-zh-v1.5",
+    )
+    print(f"Activated retrieval index {manifest['version']}")
 
 
 if __name__ == "__main__":
