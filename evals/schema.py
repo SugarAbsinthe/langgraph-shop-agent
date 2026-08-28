@@ -25,7 +25,6 @@ StageName = Literal[
     "summary",
 ]
 ToolName = Literal[
-    "search_products",
     "get_product_detail",
     "get_reviews",
     "compare_products",

@@ -12,6 +12,10 @@ from src.agent.shopping_tools import (
 
 
 class TestCreateSearchProducts:
+    def test_legacy_search_tool_remains_available_outside_main_agent(self):
+        tool = create_search_products(Mock())
+        assert tool.name == "search_products"
+
     def test_returns_formatted_result(self):
         mock_retriever = Mock()
         mock_retriever.retrieve.return_value = "## 产品\n### 1. Test"
@@ -67,3 +71,28 @@ class TestCreateCompareProducts:
         tool = create_compare_products(str(tmp_path / "test.db"))
         result = tool.invoke({"product_ids": "1"})
         assert "至少" in result
+
+
+def test_main_agent_does_not_register_duplicate_search_tool(tmp_path):
+    from src.agent.shopping_agent import ShoppingGuideAgent
+
+    llm = Mock()
+    llm.bind_tools.return_value = llm
+    agent = ShoppingGuideAgent(
+        llm=llm,
+        product_retriever=Mock(),
+        profile_store=Mock(),
+        catalog_db=str(tmp_path / "products.db"),
+        reviews_db=str(tmp_path / "reviews.db"),
+        checkpoint_db_path=str(tmp_path / "checkpoints.db"),
+    )
+    registered = {tool.name for tool in agent.graph.tools}
+    assert "search_products" not in registered
+    assert registered == {
+        "get_product_detail",
+        "get_reviews",
+        "compare_products",
+        "get_user_profile",
+        "update_user_profile",
+    }
+    agent.close()

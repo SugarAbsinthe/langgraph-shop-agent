@@ -11,7 +11,6 @@ from langchain_core.messages import HumanMessage, AIMessage
 
 from src.agent.langgraph_engine import ShoppingGuideGraph
 from src.agent.shopping_tools import (
-    create_search_products,
     create_get_product_detail,
     create_get_reviews,
     create_compare_products,
@@ -32,7 +31,7 @@ from src.config import config
 class ShoppingGuideAgent:
     """Complete shopping guide Agent with per-stage prompt injection.
 
-    Wraps: LLM, ProductRetriever, ProfileStore, ShoppingGuideGraph (4-node).
+    Wraps: LLM, ProductRetriever, ProfileStore, ShoppingGuideGraph (5-node).
     """
 
     def __init__(
@@ -56,7 +55,6 @@ class ShoppingGuideAgent:
 
         # Create tools via factory functions (no module globals)
         tools = [
-            create_search_products(product_retriever),
             create_get_product_detail(self.catalog_db),
             create_get_reviews(self.reviews_db),
             create_compare_products(self.catalog_db),

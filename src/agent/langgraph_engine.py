@@ -600,11 +600,21 @@ def build_retrieval_constraints(structured_profile: dict) -> dict:
         return str(item.get("value", "")) if isinstance(item, dict) else ""
 
     constraints: dict = {}
-    budget_numbers = [int(item) for item in re.findall(r"\d+", value("budget"))[:2]]
-    if len(budget_numbers) == 1:
-        constraints["max_price"] = budget_numbers[0]
-    elif len(budget_numbers) == 2:
-        constraints["min_price"], constraints["max_price"] = sorted(budget_numbers)
+    budget = value("budget").strip()
+    if budget:
+        canonical_budget = parse_budget_expression(f"预算{budget}") or budget
+        upper_match = re.fullmatch(r"<=\s*(\d+)", canonical_budget)
+        range_match = re.fullmatch(r"(\d+)\s*-\s*(\d+)", canonical_budget)
+        single_match = re.fullmatch(r"(\d+)", canonical_budget)
+        if upper_match:
+            constraints["max_price"] = int(upper_match.group(1))
+        elif range_match:
+            minimum, maximum = map(int, range_match.groups())
+            if minimum <= maximum:
+                constraints["min_price"] = minimum
+                constraints["max_price"] = maximum
+        elif single_match:
+            constraints["max_price"] = int(single_match.group(1))
 
     category = value("product_category").strip()
     if category:
@@ -618,6 +628,105 @@ def build_retrieval_constraints(structured_profile: dict) -> dict:
         if preferred.casefold() == excluded.casefold():
             constraints.pop("preferred_brands", None)
     return constraints
+
+
+BUDGET_AROUND_TOLERANCE = 0.10
+_PRICE_TOKEN_PATTERN = (
+    r"(?:\d+(?:\.\d+)?\s*(?:[kKwW]|万|千)?|"
+    r"[一二两三四五六七八九]万[一二两三四五六七八九]?|"
+    r"[一二两三四五六七八九]千[一二两三四五六七八九]?)"
+)
+
+
+def _parse_price_amount(raw: str) -> int | None:
+    """Parse a bounded set of shopping-price expressions without guessing."""
+    import re
+
+    token = raw.replace(",", "").replace("，", "").replace("元", "").strip()
+    arabic = re.fullmatch(r"(\d+(?:\.\d+)?)\s*([kKwW]|万|千)?", token)
+    if arabic:
+        value = float(arabic.group(1))
+        unit = arabic.group(2) or ""
+        multiplier = 1000 if unit in {"k", "K", "千"} else 10000 if unit in {"w", "W", "万"} else 1
+        return int(round(value * multiplier))
+
+    digits = {"一": 1, "二": 2, "两": 2, "三": 3, "四": 4, "五": 5,
+              "六": 6, "七": 7, "八": 8, "九": 9}
+    chinese = re.fullmatch(r"([一二两三四五六七八九])(万|千)([一二两三四五六七八九])?", token)
+    if chinese:
+        leading = digits[chinese.group(1)]
+        unit = chinese.group(2)
+        trailing = digits.get(chinese.group(3), 0)
+        if unit == "万":
+            return leading * 10000 + trailing * 1000
+        return leading * 1000 + trailing * 100
+    return None
+
+
+def parse_budget_expression(message: str) -> str | None:
+    """Normalize explicit budget language into a profile-safe string.
+
+    Canonical forms remain compatible with the existing string profile store:
+    ``<=6000`` for a hard upper bound and ``5400-6600`` for a range.
+    Approximate budgets use a configurable +/-10 percent interval.
+    """
+    import re
+
+    text = message.replace(",", "").replace("，", "")
+    flags = re.IGNORECASE
+
+    range_match = re.search(
+        rf"(?P<low>{_PRICE_TOKEN_PATTERN})\s*元?\s*(?:-|—|~|～|到|至)\s*"
+        rf"(?P<high>{_PRICE_TOKEN_PATTERN})\s*元?",
+        text,
+        flags,
+    )
+    if range_match:
+        low = _parse_price_amount(range_match.group("low"))
+        high = _parse_price_amount(range_match.group("high"))
+        if low is not None and high is not None and low <= high:
+            return f"{low}-{high}"
+        return None
+
+    upper_match = re.search(
+        rf"(?P<amount>{_PRICE_TOKEN_PATTERN})\s*元?\s*(?:以内|以下|之内)",
+        text,
+        flags,
+    ) or re.search(
+        rf"(?:不超过|最多|上限(?:是|为)?)\s*(?P<amount>{_PRICE_TOKEN_PATTERN})\s*元?",
+        text,
+        flags,
+    )
+    if upper_match:
+        amount = _parse_price_amount(upper_match.group("amount"))
+        return f"<={amount}" if amount is not None else None
+
+    around_match = re.search(
+        rf"(?P<amount>{_PRICE_TOKEN_PATTERN})\s*元?\s*(?:左右|上下)",
+        text,
+        flags,
+    ) or re.search(
+        rf"(?:大约|大概|约)\s*(?P<amount>{_PRICE_TOKEN_PATTERN})\s*元?",
+        text,
+        flags,
+    )
+    if around_match:
+        amount = _parse_price_amount(around_match.group("amount"))
+        if amount is None:
+            return None
+        lower = int(round(amount * (1 - BUDGET_AROUND_TOLERANCE)))
+        upper = int(round(amount * (1 + BUDGET_AROUND_TOLERANCE)))
+        return f"{lower}-{upper}"
+
+    bare_match = re.search(
+        rf"预算\s*[:：]?\s*(?P<amount>{_PRICE_TOKEN_PATTERN})\s*元?",
+        text,
+        flags,
+    )
+    if bare_match:
+        amount = _parse_price_amount(bare_match.group("amount"))
+        return f"<={amount}" if amount is not None else None
+    return None
 
 
 def classify_stage(user_message: str, current_stage: str, llm=None,
@@ -648,15 +757,16 @@ def classify_stage(user_message: str, current_stage: str, llm=None,
                                         "散热", "卡不卡", "耐用", "翻车", "差评"]):
         return "objection_handling"
 
-    # Needs keywords → needs_elicitation
-    if any(kw in msg_lower for kw in ["预算", "打游戏", "办公", "出差", "学生", "轻薄",
-                                        "画图", "剪视频", "编程", "做图", "渲染"]):
-        return "needs_elicitation"
-
     # Search intent → search
     if any(kw in msg_lower for kw in ["推荐", "找", "搜索", "有没有", "买什么", "选一个",
                                         "有什么", "哪些"]):
         return "search"
+
+    # Needs keywords → needs_elicitation. Explicit search intent wins when a
+    # message contains both requirements and a request for recommendations.
+    if any(kw in msg_lower for kw in ["预算", "打游戏", "办公", "出差", "学生", "轻薄",
+                                        "画图", "剪视频", "编程", "做图", "渲染"]):
+        return "needs_elicitation"
 
     # Summary/closing
     if any(kw in msg_lower for kw in ["谢谢", "好的", "了解了", "就这个", "下单", "买了"]):
@@ -691,22 +801,14 @@ def extract_profile_signals(conv_id: str, user_message: str, profile_store) -> N
     import re
     msg = user_message
 
-    # Budget patterns
-    budget_patterns = [
-        (r"预算\s*[:：]?\s*(\d{3,5})\s*[-到~至]\s*(\d{3,5})", lambda m: f"{m.group(1)}-{m.group(2)}"),
-        (r"预算\s*[:：]?\s*(\d{3,5})", lambda m: f"{m.group(1)}-{int(m.group(1))*1.2:.0f}"),
-        (r"(\d{4})\s*[-到~至]\s*(\d{4,5})", lambda m: f"{m.group(1)}-{m.group(2)}"),
-        (r"([一二两三四五六七八九])\s*万", lambda m: f"{'一二两三四五六七八九'.index(m.group(1))*10000}-{('一二两三四五六七八九'.index(m.group(1))+1)*10000}"),
-    ]
-    for pattern, formatter in budget_patterns:
-        match = re.search(pattern, msg)
-        if match:
-            try:
-                budget = formatter(match)
-                profile_store.update(conv_id, "budget", budget, confidence=0.8, source="deduced")
-            except Exception:
-                pass
-            break
+    budget = parse_budget_expression(msg)
+    if budget:
+        try:
+            profile_store.update(
+                conv_id, "budget", budget, confidence=0.8, source="deduced"
+            )
+        except Exception:
+            pass
 
     # Product category detection
     category_map = {

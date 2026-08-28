@@ -37,10 +37,10 @@ def test_contract_rejects_overlapping_tool_expectations():
             "id": "invalid_overlap",
             "question": "test",
             "expected_stages": ["search"],
-            "required_tools": ["search_products"],
-            "forbidden_tools": ["search_products"],
+            "required_tools": ["get_reviews"],
+            "forbidden_tools": ["get_reviews"],
             "expected_retrieval": True,
-            "scripted_tool_rounds": [["search_products"]],
+            "scripted_tool_rounds": [["get_reviews"]],
         })
 
 
@@ -53,7 +53,7 @@ def test_contract_rejects_required_tool_outside_executable_rounds():
             "required_tools": ["get_reviews"],
             "expected_retrieval": True,
             "max_tool_rounds": 1,
-            "scripted_tool_rounds": [["search_products"], ["get_reviews"]],
+            "scripted_tool_rounds": [["get_product_detail"], ["get_reviews"]],
         })
 
 

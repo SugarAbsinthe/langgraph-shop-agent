@@ -52,7 +52,7 @@ def test_tool_error_and_loop_limit_cases_pass():
     assert tool_error.stop_reason == "tool_error"
     assert loop_limit.passed
     assert loop_limit.stop_reason == "max_tool_rounds"
-    assert loop_limit.tools == ["search_products"]
+    assert loop_limit.tools == ["get_product_detail"]
 
 
 def test_report_writer_outputs_json_and_markdown(tmp_path):

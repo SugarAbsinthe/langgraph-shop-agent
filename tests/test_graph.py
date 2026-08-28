@@ -12,6 +12,7 @@ from src.agent.langgraph_engine import (
     ShoppingState,
     build_retrieval_constraints,
     classify_stage,
+    parse_budget_expression,
 )
 
 
@@ -42,6 +43,7 @@ class TestClassifyStage:
     def test_search_intent(self):
         assert classify_stage("推荐游戏本", "discovery") == "search"
         assert classify_stage("有哪些笔记本", "discovery") == "search"
+        assert classify_stage("推荐预算6k以内的办公本", "discovery") == "search"
 
     def test_needs_keywords(self):
         assert classify_stage("预算8000打游戏", "discovery") == "needs_elicitation"
@@ -95,11 +97,27 @@ class TestGraphRouting:
 
 
 class TestExtractProfileSignals:
-    def test_budget_extraction(self):
+    @pytest.mark.parametrize(
+        ("message", "expected"),
+        [
+            ("预算6k以内", "<=6000"),
+            ("预算5000到6500", "5000-6500"),
+            ("预算6k左右", "5400-6600"),
+            ("预算1.2w以下", "<=12000"),
+            ("预算一万一以内", "<=11000"),
+            ("预算6000元", "<=6000"),
+        ],
+    )
+    def test_budget_extraction(self, message, expected):
         from src.agent.langgraph_engine import extract_profile_signals
         mock_store = Mock()
-        extract_profile_signals("test_conv", "预算8000左右", mock_store)
-        assert mock_store.update.called
+        extract_profile_signals("test_conv", message, mock_store)
+        mock_store.update.assert_called_once_with(
+            "test_conv", "budget", expected, confidence=0.8, source="deduced"
+        )
+
+    def test_reversed_budget_range_is_not_silently_reordered(self):
+        assert parse_budget_expression("预算8000到5000") is None
 
 
 def _make_graph(max_tool_rounds=3):
@@ -152,7 +170,7 @@ class StreamingFakeLLM(BaseChatModel):
 
 
 class FakeRetriever:
-    def retrieve(self, query, top_k=5):
+    def retrieve(self, query, top_k=5, filters=None):
         return "context"
 
 
@@ -178,6 +196,66 @@ def test_profile_constraints_are_structured_and_exclusion_wins_conflict():
         "category": "笔记本电脑",
         "excluded_brands": ["联想"],
     }
+
+
+def test_search_turn_retrieves_once_with_structured_hard_constraints():
+    class RecordingRetriever:
+        def __init__(self):
+            self.calls = []
+
+        def retrieve(self, query, top_k=5, filters=None):
+            self.calls.append({"query": query, "top_k": top_k, "filters": filters})
+            return "context"
+
+    class StructuredProfileStore:
+        def __init__(self):
+            self.values = {}
+
+        def update(self, conv_id, key, value, **kwargs):
+            self.values[key] = value
+
+        def serialize_profile(self, conv_id):
+            return "\n".join(f"- {key}: {value}" for key, value in self.values.items())
+
+        def get_structured(self, conv_id):
+            return {
+                key: {"value": value, "confidence": 0.8, "source": "deduced"}
+                for key, value in self.values.items()
+            }
+
+    retriever = RecordingRetriever()
+    graph = ShoppingGuideGraph(
+        llm=FakeToolLLM([AIMessage(content="final")]),
+        tools=[],
+        product_retriever=retriever,
+        profile_store=StructuredProfileStore(),
+        system_prompt="test {conv_id} {stage} {user_profile} {product_context}",
+        stage_classifier_prompt="",
+    )
+    result = graph.run("推荐预算6k以内的办公笔记本，不要戴尔", "constraint-conv")
+    assert result["stage"] == "search"
+    assert len(retriever.calls) == 1
+    assert retriever.calls[0]["top_k"] == 5
+    assert retriever.calls[0]["filters"] == {
+        "max_price": 6000,
+        "category": "笔记本电脑",
+        "excluded_brands": ["戴尔"],
+    }
+    graph.close()
+
+
+@pytest.mark.parametrize(
+    ("budget", "expected"),
+    [
+        ("<=6000", {"max_price": 6000}),
+        ("5000-6500", {"min_price": 5000, "max_price": 6500}),
+        ("6k以内", {"max_price": 6000}),
+        ("6k左右", {"min_price": 5400, "max_price": 6600}),
+        ("6000", {"max_price": 6000}),
+    ],
+)
+def test_budget_profile_values_map_to_expected_constraints(budget, expected):
+    assert build_retrieval_constraints({"budget": {"value": budget}}) == expected
 
 
 def _lifecycle_graph(responses, max_tool_rounds=3):

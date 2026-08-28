@@ -256,7 +256,7 @@ SHOPPING_TOOLS = [
 
 def create_search_products(product_retriever):
     """Factory: returns a search_products tool closing over a specific retriever."""
-    @tool
+    @tool("search_products")
     def _search_products(query: str, top_k: int = 5) -> str:
         """Search the product catalog using semantic search.
 
@@ -279,7 +279,7 @@ def create_search_products(product_retriever):
 
 def create_get_product_detail(catalog_db: str):
     """Factory: returns a get_product_detail tool closing over a specific catalog path."""
-    @tool
+    @tool("get_product_detail")
     def _get_product_detail(product_id: int) -> str:
         """Get the complete specification sheet for a specific product.
 
@@ -309,7 +309,7 @@ def create_get_product_detail(catalog_db: str):
 
 def create_get_reviews(reviews_db: str):
     """Factory: returns a get_reviews tool closing over a specific reviews path."""
-    @tool
+    @tool("get_reviews")
     def _get_reviews(product_id: int, aspect: str = "", top_k: int = 5) -> str:
         """Get user reviews for a specific product, optionally filtered by aspect.
 
@@ -354,7 +354,7 @@ def create_get_reviews(reviews_db: str):
 
 def create_compare_products(catalog_db: str):
     """Factory: returns a compare_products tool closing over a specific catalog path."""
-    @tool
+    @tool("compare_products")
     def _compare_products(product_ids: str) -> str:
         """Compare 2-4 products side by side across all key specifications.
 
@@ -419,7 +419,7 @@ def create_compare_products(catalog_db: str):
 
 def create_get_user_profile(profile_store):
     """Factory: returns a get_user_profile tool closing over a specific profile store."""
-    @tool
+    @tool("get_user_profile")
     def _get_user_profile(conv_id: str) -> str:
         """Get the current user profile including all known preferences and constraints.
 
@@ -437,7 +437,7 @@ def create_get_user_profile(profile_store):
 
 def create_update_user_profile(profile_store):
     """Factory: returns an update_user_profile tool closing over a specific profile store."""
-    @tool
+    @tool("update_user_profile")
     def _update_user_profile(conv_id: str, key: str, value: str) -> str:
         """Update the user's preference profile with a new key-value pair.
 

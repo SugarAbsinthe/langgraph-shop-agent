@@ -49,6 +49,16 @@ class TestStagePromptMapping:
     def test_search_prompt_has_product_context_placeholder(self):
         assert "{product_context}" in SEARCH_AGENT_PROMPT
 
+    def test_active_prompts_do_not_expose_duplicate_search_tool(self):
+        for prompt in {
+            SHOPPING_SYSTEM_PROMPT,
+            DISCOVERY_AGENT_PROMPT,
+            SEARCH_AGENT_PROMPT,
+            COMPARE_AGENT_PROMPT,
+            RECOMMEND_AGENT_PROMPT,
+        }:
+            assert "search_products" not in prompt
+
     def test_all_stage_prompts_include_style_guide(self):
         for name in ["DISCOVERY", "SEARCH", "COMPARE", "RECOMMEND"]:
             prompt = globals()[f"{name}_AGENT_PROMPT"]

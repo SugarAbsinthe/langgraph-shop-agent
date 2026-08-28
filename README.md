@@ -6,7 +6,7 @@
  React 前端 ──真实 Token SSE──→ FastAPI ──→ Agent (单例)
                                   ├─ 阶段分析 → 规则 + LLM 七阶段分类
                                   ├─ 商品检索 → 描述/规格向量 + FTS5 + RRF + 硬约束
-                                  ├─ 推理决策 → per-stage Prompt 动态注入 + 6 工具
+                                  ├─ 推理决策 → per-stage Prompt 动态注入 + 5 工具
                                   └─ 工具调用 → 工厂模式依赖注入
                                   ├─ 图状态 → LangGraph SQLite Checkpoint
                                   └─ 会话画像 → SQLite KV + 置信度时间衰减
@@ -31,7 +31,7 @@ cd frontend && npm install && npm run dev
 ## 项目结构
 
 ```
-src/agent/       LangGraph 编排、per-stage Prompt、6 工具
+src/agent/       LangGraph 编排、确定性商品召回、per-stage Prompt、5 工具
 src/retrieval/   描述/规格向量、FTS5、RRF 融合与结构化约束
 src/profile/     会话画像存储（主链路使用 SQLite，保留语义记忆接口）
 src/cache/       Redis RAG 缓存
@@ -50,7 +50,7 @@ ChromaDB 或外网，可作为日常回归入口：
 python -m evals.runner --mode deterministic
 ```
 
-内置 25 个中文案例，覆盖七类会话阶段、六类工具、检索触发、画像提取、
+内置 25 个中文案例，覆盖七类会话阶段、五类主 Agent 工具、检索触发、画像提取、
 工具异常和轮次上限。命令输出阶段正确率、工具边界、停止原因、检索行为、
 非空答复率及延迟分位数，JSON/Markdown 报告生成到已忽略的
 `evals/results/`。
